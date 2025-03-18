@@ -1,0 +1,544 @@
+---
+title: "normalized alpha diversity analysis with Xu et al chinese cohort data based all taxa between taxonomic classification methods"
+author: "Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: paper
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+
+#specify file path
+outpath <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/Chinese_cohort/output/"
+meta.dir <- "/restricted/projectnb/necs/Data_library/Metabolomics/resources/Xu_plasma_metabolite_analysis/"
+sra.dir <- "/restricted/projectnb/uh2-sebas/data/metagenomics/external_cohorts/Han_Chinese_Centenarian/metadata/"
+
+#metaphlan normalized alpha diversity scores across all taxonomic levels
+metaphlan_entropy <- "entropy.metaphlan4.chinese.csv"
+#bracken normalized alpha diversity scores across all taxonomic levels
+#with log10 read count threshold 1 and unique kmer minimizer count threshold 3
+bracken_entropy <- "entropy.bracken.chinese.R1.K3.csv"
+
+#metadata
+phenofl <- "phenotype.xlsx"
+
+#set seed
+set.seed(157)
+
+```
+
+This script is for diversity analysis using data after QC.
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/function/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/function/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    dplyr::select(tax.name, biom_samplenames) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+
+# Read in phenotypic data
+
+
+```{r, message=FALSE}
+# Extract phenotypic data
+#load clinical metadata information
+#clinical.data <- read_excel(paste0(meta.dir, "DifferentialAbundance_Supplement.xlsx"), sheet = "Table S1 Metadata", skip = 1)
+clinical.data <- read_excel(paste0(meta.dir, phenofl))
+
+#add ethnicity variable
+clinical.data$ethnicity <- "han_chinese"
+
+
+#extract sample IDs and create family ID and group ID
+sample.ID <- clinical.data %>% dplyr::select(1) %>% pull()
+
+fam.group <- str_remove(sample.ID, "QCS-") %>%                       
+              str_split("-") %>%
+                unlist() 
+
+fam.group <- matrix(fam.group, nrow=2)
+
+#create family ID
+fam.id <- fam.group[1,]
+
+#create group ID
+group.id <- fam.group[2,]
+group.id[group.id == "1"] <- "Advanced Age"
+group.id[group.id == "2" | group.id == "3"] <- "Offspring"
+
+
+#add to clinical data
+clinical.clean <- clinical.data %>%
+  mutate(sample.ID = sample.ID, fam.id = fam.id, group = group.id) 
+clinical.clean$"C-age (years)" <- as.integer(clinical.clean$"C-age (years)")
+
+
+#load sample Run names and sample SRA names
+SRA.data <- read_csv(paste0(sra.dir,"SraRunInfo.csv"))
+
+SRA.clean <- SRA.data %>% 
+  dplyr::select(Run, SampleName) 
+
+#sample ID and sample SRA names
+sample.dict <- read_excel(paste0(sra.dir, "sample name-sequencing ID sheet.xlsx"))
+
+#combine files
+sample.info <- dplyr::inner_join(SRA.clean, sample.dict, by = c("SampleName"))
+
+pheno.data <- dplyr::inner_join(sample.info, clinical.clean, by = c("sample.ID")) %>% 
+                                  dplyr::select(-c(sample.ID)) %>%
+                                  mutate(stool_kit = Run, Sample=Run) %>%
+                                  dplyr::rename(c_age_years="C-age (years)")
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+```
+
+
+
+# normalized alpha diversity analysis using normalized alpha diversity 
+
+## Metaphlan: normalized alpha diversity
+
+```{r}
+#pull all results
+metaphlan.ctds <- read_csv(file=paste0(outpath, metaphlan_entropy))
+
+#species level
+metaphlan.ctds.species <- metaphlan.ctds %>% dplyr::select(sample.ID, species_statistic) %>%
+  dplyr::rename(metaphlan_statistic=species_statistic)
+metaphlan.ctds.species$sample.ID <- as.character(metaphlan.ctds.species$sample.ID)
+
+
+#genus level
+metaphlan.ctds.genus <- metaphlan.ctds %>% dplyr::select(sample.ID, genus_statistic) %>%
+  dplyr::rename(metaphlan_statistic=genus_statistic)
+metaphlan.ctds.genus$sample.ID <- as.character(metaphlan.ctds.genus$sample.ID)
+
+
+#family level
+metaphlan.ctds.family <- metaphlan.ctds %>% dplyr::select(sample.ID, family_statistic) %>%
+  dplyr::rename(metaphlan_statistic=family_statistic)
+metaphlan.ctds.family$sample.ID <- as.character(metaphlan.ctds.family$sample.ID)
+
+#order level
+metaphlan.ctds.order <- metaphlan.ctds %>% dplyr::select(sample.ID, order_statistic) %>%
+  dplyr::rename(metaphlan_statistic=order_statistic)
+metaphlan.ctds.order$sample.ID <- as.character(metaphlan.ctds.order$sample.ID)
+
+
+#class level
+metaphlan.ctds.class <- metaphlan.ctds %>% dplyr::select(sample.ID, class_statistic) %>%
+  dplyr::rename(metaphlan_statistic=class_statistic)
+metaphlan.ctds.class$sample.ID <- as.character(metaphlan.ctds.class$sample.ID)
+
+
+#phylum level
+metaphlan.ctds.phylum <- metaphlan.ctds %>% dplyr::select(sample.ID, phylum_statistic) %>%
+  dplyr::rename(metaphlan_statistic=phylum_statistic)
+metaphlan.ctds.phylum$sample.ID <- as.character(metaphlan.ctds.phylum$sample.ID)
+
+
+
+```
+
+## Bracken
+
+```{r}
+#pull all results
+bracken.ctds <- read_csv(file=paste0(outpath, bracken_entropy))
+
+#species level
+bracken.ctds.species <- bracken.ctds %>% dplyr::select(sample.ID, species_statistic) %>%
+  dplyr::rename(bracken_statistic=species_statistic)
+bracken.ctds.species$sample.ID <- as.character(bracken.ctds.species$sample.ID)
+
+
+#genus level
+bracken.ctds.genus <- bracken.ctds %>% dplyr::select(sample.ID, genus_statistic) %>%
+  dplyr::rename(bracken_statistic=genus_statistic)
+bracken.ctds.genus$sample.ID <- as.character(bracken.ctds.genus$sample.ID)
+
+
+#family level
+bracken.ctds.family <- bracken.ctds %>% dplyr::select(sample.ID, family_statistic) %>%
+  dplyr::rename(bracken_statistic=family_statistic)
+bracken.ctds.family$sample.ID <- as.character(bracken.ctds.family$sample.ID)
+
+
+#order level
+bracken.ctds.order <- bracken.ctds %>% dplyr::select(sample.ID, order_statistic) %>%
+  dplyr::rename(bracken_statistic=order_statistic)
+bracken.ctds.order$sample.ID <- as.character(bracken.ctds.order$sample.ID)
+
+
+#class level
+bracken.ctds.class <- bracken.ctds %>% dplyr::select(sample.ID, class_statistic) %>%
+  dplyr::rename(bracken_statistic=class_statistic)
+bracken.ctds.class$sample.ID <- as.character(bracken.ctds.class$sample.ID)
+
+
+#phylum level
+bracken.ctds.phylum <- bracken.ctds %>% dplyr::select(sample.ID, phylum_statistic) %>%
+  dplyr::rename(bracken_statistic=phylum_statistic)
+bracken.ctds.phylum$sample.ID <- as.character(bracken.ctds.phylum$sample.ID)
+
+
+
+```
+
+## Combine results across methods
+
+```{r}
+
+#species level
+combined.ctds.species <- dplyr::inner_join(metaphlan.ctds.species, bracken.ctds.species, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+
+#species level
+combined.ctds.genus <- dplyr::inner_join(metaphlan.ctds.genus, bracken.ctds.genus, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+
+#family level
+combined.ctds.family <- dplyr::inner_join(metaphlan.ctds.family, bracken.ctds.family, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+
+#order level
+combined.ctds.order <- dplyr::inner_join(metaphlan.ctds.order, bracken.ctds.order, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+
+#class level
+combined.ctds.class <- dplyr::inner_join(metaphlan.ctds.class, bracken.ctds.class, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+
+#phylum level
+combined.ctds.phylum <- dplyr::inner_join(metaphlan.ctds.phylum, bracken.ctds.phylum, by="sample.ID") %>%
+  dplyr::inner_join(pheno.data, by=c("sample.ID"="Sample"))
+```
+
+
+# Correlation between normalized alpha diversity based on method
+
+```{r}
+#species level
+cor.species <- cor.test(combined.ctds.species$metaphlan_statistic, combined.ctds.species$bracken_statistic)
+est.species <- broom::tidy(cor.species) %>% pull(estimate) %>% signif(2)
+pval.species <- broom::tidy(cor.species) %>% pull(p.value) %>% signif(3)
+cor.species
+
+#genus level
+cor.genus <- cor.test(combined.ctds.genus$metaphlan_statistic, combined.ctds.genus$bracken_statistic)
+est.genus <- broom::tidy(cor.genus) %>% pull(estimate) %>% signif(2)
+pval.genus <- broom::tidy(cor.genus) %>% pull(p.value) %>% signif(3)
+cor.genus
+
+#family level
+cor.family <- cor.test(combined.ctds.family$metaphlan_statistic, combined.ctds.family$bracken_statistic)
+est.family <- broom::tidy(cor.family) %>% pull(estimate) %>% signif(2)
+pval.family <- broom::tidy(cor.family) %>% pull(p.value) %>% signif(3)
+cor.family
+
+#order level
+cor.order <- cor.test(combined.ctds.order$metaphlan_statistic, combined.ctds.order$bracken_statistic)
+est.order <- broom::tidy(cor.order) %>% pull(estimate) %>% signif(2)
+pval.order <- broom::tidy(cor.order) %>% pull(p.value) %>% signif(3)
+cor.order
+
+#class level
+cor.class <- cor.test(combined.ctds.class$metaphlan_statistic, combined.ctds.class$bracken_statistic)
+est.class <- broom::tidy(cor.class) %>% pull(estimate) %>% signif(2)
+pval.class <- broom::tidy(cor.class) %>% pull(p.value) %>% signif(3)
+cor.class
+
+#phylum level
+cor.phylum <- cor.test(combined.ctds.phylum$metaphlan_statistic, combined.ctds.phylum$bracken_statistic)
+est.phylum <- broom::tidy(cor.phylum) %>% pull(estimate) %>% signif(2)
+pval.phylum <- broom::tidy(cor.phylum) %>% pull(p.value) %>% signif(3)
+cor.phylum
+```
+
+## Visualize the differences in adjused entropy based on method
+
+```{r}
+#For species level
+boxplot(combined.ctds.species$metaphlan_statistic, combined.ctds.species$bracken_statistic, main="Species", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+    
+#For genus level
+boxplot(combined.ctds.genus$metaphlan_statistic, combined.ctds.genus$bracken_statistic, main="Genus", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+    
+#For family level
+boxplot(combined.ctds.family$metaphlan_statistic, combined.ctds.family$bracken_statistic, main="Family", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+  
+#For order level
+boxplot(combined.ctds.order$metaphlan_statistic, combined.ctds.order$bracken_statistic, main="Order", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+  
+#For class level
+boxplot(combined.ctds.class$metaphlan_statistic, combined.ctds.class$bracken_statistic, main="Class", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+  
+#For phylum level
+boxplot(combined.ctds.phylum$metaphlan_statistic, combined.ctds.phylum$bracken_statistic, main="Phylum", xlab="method", ylab="normalized alpha diversity", ylim=c(-1,0), names=c("MetaPhlAn4", "Bracken"))
+  
+```
+
+
+```{r, fig.dim = c(30,20)}
+# Species
+# Plot paired scores
+p.s_comp <- ggplot(combined.ctds.species, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Species", subtitle = paste0("r=",est.species,",p=",pval.species), x = "MetaPhlan4", y = "Bracken")
+
+# genus
+# Plot paired scores
+p.g_comp <-ggplot(combined.ctds.genus, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Genus", subtitle = paste0("r=",est.genus,",p=",pval.genus), x = "MetaPhlan4", y = "Bracken")
+
+
+# family
+# Plot paired scores
+p.f_comp <-ggplot(combined.ctds.family, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Family", subtitle = paste0("r=",est.family,",p=",pval.family), x = "MetaPhlan4", y = "Bracken") 
+
+
+# order
+# Plot paired scores
+p.o_comp <-ggplot(combined.ctds.order, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Order", subtitle = paste0("r=",est.order,",p=",pval.order), x = "MetaPhlan4", y = "Bracken") 
+
+
+# class
+# Plot paired scores
+p.c_comp <-ggplot(combined.ctds.class, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Class", subtitle = paste0("r=",est.class,",p=",pval.class), x = "MetaPhlan4", y = "Bracken")
+
+
+# phylum
+# Plot paired scores
+p.p_comp <-ggplot(combined.ctds.phylum, aes(x = metaphlan_statistic, y = bracken_statistic)) +
+  geom_point() +
+  theme_bw(base_size = 40) +
+  xlim(-1,0) +
+  ylim(-1,0) +
+  geom_abline(intercept = 0 , slope = 1 ) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Phylum", subtitle = paste0("r=",est.phylum,",p=",pval.phylum), x = "MetaPhlan4", y = "Bracken") 
+
+
+#Plot together in one panel (30 by 8)
+ggpubr::ggarrange(p.p_comp, p.c_comp, p.o_comp, p.f_comp, p.g_comp, p.s_comp,
+           ncol = 3, nrow = 2)
+
+#create directory
+dir.create(paste0(outpath, "Figures/all_taxa_method_comparison"))
+
+#save figures
+png(paste0(outpath,"Figures/all_taxa_method_comparison/entropy_methodcomp_all.taxa_chinese_alllevels.png"), units="in", width=30, height=20, res=300)
+ggpubr::ggarrange(p.p_comp, p.c_comp, p.o_comp, p.f_comp, p.g_comp, p.s_comp,
+           ncol = 3, nrow = 2)
+dev.off()
+ 
+png(paste0(outpath,"Figures/all_taxa_method_comparison/entropy_methodcomp_all.taxa_chinese_main.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.p_comp, p.g_comp, p.s_comp,
+           ncol = 3, nrow = 1)
+dev.off()
+
+
+png(paste0(outpath,"Figures/all_taxa_method_comparison/entropy_methodcomp_all.taxa_chinese_supp.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.c_comp, p.o_comp, p.f_comp,
+           ncol = 3, nrow = 1)
+dev.off()
+
+
+```
+
+
+

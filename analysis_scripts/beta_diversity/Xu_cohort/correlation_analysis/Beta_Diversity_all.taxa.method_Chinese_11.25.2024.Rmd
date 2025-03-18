@@ -1,0 +1,824 @@
+---
+title: "Beta diversity analysis with Xu et al chinese cohort data based all taxa between taxonomic classification methods"
+author: "Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: paper
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(dynamicTreeCut)
+#microbiome and single cell specific packages
+library(vegan)
+library(mia)
+library(scater)
+#write excel sheets
+library(writexl)
+library(RColorBrewer)
+
+#specify file path
+flpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/external_cohorts/Han_Chinese_Centenarian/processed_data/data_library/"
+outpath <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/02_beta_diversity_analysis/Chinese_cohort/output/"
+meta.dir <- "/restricted/projectnb/necs/Data_library/Metabolomics/resources/Xu_plasma_metabolite_analysis/"
+sra.dir <- "/restricted/projectnb/uh2-sebas/data/metagenomics/external_cohorts/Han_Chinese_Centenarian/metadata/"
+
+#metaphlan data
+metaphlan_otufl <- "metaphlan4_renorm_chinese_phyloseq.10.23.2024.rds"
+#bracken data with log10 read count threshold 1 and unique kmer minimizer count threshold 3
+bracken_otufl <- "bracken_renorm_chinese_phyloseq.R1.K3.10.22.2024.rds"
+
+#metadata
+phenofl <- "phenotype.xlsx"
+
+#set seed
+set.seed(157)
+
+```
+
+# Functions
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    select(c(tax.name, biom_samplenames)) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+# Read in phenotypic data
+
+
+```{r, message=FALSE}
+# Extract phenotypic data
+#load clinical metadata information
+#clinical.data <- read_excel(paste0(meta.dir, "DifferentialAbundance_Supplement.xlsx"), sheet = "Table S1 Metadata", skip = 1)
+clinical.data <- read_excel(paste0(meta.dir, phenofl))
+
+#add ethnicity variable
+clinical.data$ethnicity <- "han_chinese"
+
+
+#extract sample IDs and create family ID and group ID
+sample.ID <- clinical.data %>% dplyr::select(1) %>% pull()
+
+fam.group <- str_remove(sample.ID, "QCS-") %>%                       
+              str_split("-") %>%
+                unlist() 
+
+fam.group <- matrix(fam.group, nrow=2)
+
+#create family ID
+fam.id <- fam.group[1,]
+
+#create group ID
+group.id <- fam.group[2,]
+group.id[group.id == "1"] <- "Advanced Age"
+group.id[group.id == "2" | group.id == "3"] <- "Offspring"
+
+
+#add to clinical data
+clinical.clean <- clinical.data %>%
+  mutate(sample.ID = sample.ID, fam.id = fam.id, group = group.id) 
+clinical.clean$"C-age (years)" <- as.integer(clinical.clean$"C-age (years)")
+
+
+#load sample Run names and sample SRA names
+SRA.data <- read_csv(paste0(sra.dir,"SraRunInfo.csv"))
+
+SRA.clean <- SRA.data %>% 
+  dplyr::select(Run, SampleName) 
+
+#sample ID and sample SRA names
+sample.dict <- read_excel(paste0(sra.dir, "sample name-sequencing ID sheet.xlsx"))
+
+#combine files
+sample.info <- dplyr::inner_join(SRA.clean, sample.dict, by = c("SampleName"))
+
+pheno.data <- dplyr::inner_join(sample.info, clinical.clean, by = c("sample.ID")) %>% 
+                                  dplyr::select(-c(sample.ID)) %>%
+                                  mutate(stool_kit = Run, Sample=Run) %>%
+                                  dplyr::rename(c_age_years="C-age (years)")
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+```
+
+
+# Metaphlan4: Read in phenotype data and phyloseq object
+```{r metaphlan data}
+#load phyloseq obj
+metaphlan_chinese_biom <- readRDS(paste0(flpath, metaphlan_otufl))
+
+#add phenotypic data to phyloseq object
+metaphlan_chinese_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+metaphlan_chinese_biom <- subset_samples(metaphlan_chinese_biom, !is.na(c_age_years))
+
+metaphlan.sample.meta <- sample_data(metaphlan_chinese_biom) %>% 
+  as_tibble(rownames="stool_kit")
+# metaphlan.samples <- metaphlan.sample.meta %>% dplyr::select(sample.ID, stool_kit)
+  
+OTU_metaphlan <- metaphlan_chinese_biom@otu_table@.Data
+# colnames(OTU_metaphlan) <- metaphlan.samples$stool_kit
+TAX_metaphlan <- metaphlan_chinese_biom@tax_table@.Data
+
+#save sample data for permanova
+# rownames(metaphlan_chinese_biom@sam_data) <- metaphlan_chinese_biom@sam_data$stool_kit
+# sample_names(metaphlan_chinese_biom) <- metaphlan_chinese_biom@sam_data$stool_kit
+metaphlan.samp.dat <- data.frame(metaphlan_chinese_biom@sam_data)
+
+```
+
+# Bracken: Read in phenotype data and phyloseq object
+```{r bracken data}
+#load phyloseq obj
+bracken_chinese_biom <- readRDS(paste0(flpath, bracken_otufl))
+
+#add phenotypic data to phyloseq object
+bracken_chinese_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+bracken_chinese_biom <- subset_samples(bracken_chinese_biom, !is.na(c_age_years))
+
+bracken.sample.meta <- sample_data(bracken_chinese_biom) %>%
+  as_tibble(rownames="stool_kit")
+# bracken.samples <- bracken.sample.meta %>% dplyr::select(sample.ID, stool_kit)
+
+#calculate relative abundances
+OTU_bracken <- bracken_chinese_biom@otu_table@.Data
+TAX_bracken <- bracken_chinese_biom@tax_table@.Data
+
+#save sample data for permanova
+# rownames(bracken_chinese_biom@sam_data) <- bracken_chinese_biom@sam_data$stool_kit
+# sample_names(bracken_chinese_biom) <- bracken_chinese_biom@sam_data$stool_kit
+bracken.samp.dat <- data.frame(bracken_chinese_biom@sam_data)
+
+```
+
+## common samples
+
+```{r}
+#metaphlan
+metaphlan.sample.meta <- metaphlan.sample.meta %>% dplyr::filter(metaphlan.sample.meta$stool_kit %in% bracken.sample.meta$stool_kit)
+dim(metaphlan.sample.meta)
+
+OTU_metaphlan <- OTU_metaphlan[, metaphlan.sample.meta$stool_kit]
+dim(OTU_metaphlan)
+
+#bracken
+bracken.sample.meta <- bracken.sample.meta %>% dplyr::filter(bracken.sample.meta$stool_kit %in% metaphlan.sample.meta$stool_kit)
+dim(bracken.sample.meta)
+
+OTU_bracken <- OTU_bracken[, bracken.sample.meta$stool_kit]
+dim(OTU_bracken)
+
+#make sure to have the same order of samples
+sample_names <- unique(colnames(OTU_bracken), colnames(OTU_metaphlan))
+```
+
+# Beta diversity across taxonomic hierarchy
+
+## Metaphlan: Create Tree Summarized Experiment object from Phyloseq object 
+
+```{r metaphlan tse}
+#convert phyloseq object to a tree summarized experiment object
+metaphlan_tse <- mia::makeTreeSummarizedExperimentFromPhyloseq(metaphlan_chinese_biom)
+metaphlan_tse
+
+
+#agglomerate based on each taxonomic rank and save as alternative assays in the object
+altExps(metaphlan_tse) <- mia::splitByRanks(metaphlan_tse)
+metaphlan_tse
+
+
+```
+
+## Bracken: Create Tree Summarized Experiment object from Phyloseq object 
+
+```{r bracken tse}
+#convert phyloseq object to a tree summarized experiment object
+bracken_tse <- mia::makeTreeSummarizedExperimentFromPhyloseq(bracken_chinese_biom)
+bracken_tse
+
+
+#agglomerate based on each taxonomic rank and save as alternative assays in the object
+altExps(bracken_tse) <- mia::splitByRanks(bracken_tse)
+bracken_tse
+
+
+```
+
+## Metaphlan: calculate bray curtis index and uniqueness
+
+```{r metaphlan BC}
+#taxa diversity for species
+metaphlan_species_tse <- altExp(metaphlan_tse,"Species")
+OTU_species <- assay(metaphlan_species_tse, "counts")[,sample_names]
+metaphlan_beta.div.species <- rbiom::beta.div(OTU_species, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.species <- apply(as.matrix(metaphlan_beta.div.species), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.species <- metaphlan_uniqueness.species %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for genus
+metaphlan_genus_tse <- altExp(metaphlan_tse,"Genus")
+OTU_genus <- assay(metaphlan_genus_tse, "counts")[,sample_names]
+metaphlan_beta.div.genus <- rbiom::beta.div(OTU_genus, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.genus <- apply(as.matrix(metaphlan_beta.div.genus), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.genus <- metaphlan_uniqueness.genus %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for family
+metaphlan_family_tse <- altExp(metaphlan_tse,"Family")
+OTU_family <- assay(metaphlan_family_tse, "counts")[,sample_names]
+metaphlan_beta.div.family <- rbiom::beta.div(OTU_family, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.family <- apply(as.matrix(metaphlan_beta.div.family), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.family <- metaphlan_uniqueness.family %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for order
+metaphlan_order_tse <- altExp(metaphlan_tse,"Order")
+OTU_order <- assay(metaphlan_order_tse, "counts")[,sample_names]
+metaphlan_beta.div.order <- rbiom::beta.div(OTU_order, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.order <- apply(as.matrix(metaphlan_beta.div.order), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.order <- metaphlan_uniqueness.order %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for class
+metaphlan_class_tse <- altExp(metaphlan_tse,"Class")
+OTU_class <- assay(metaphlan_class_tse, "counts")[,sample_names]
+metaphlan_beta.div.class <- rbiom::beta.div(OTU_class, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.class <- apply(as.matrix(metaphlan_beta.div.class), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.class <- metaphlan_uniqueness.class %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for phylum
+metaphlan_phylum_tse <- altExp(metaphlan_tse,"Phylum")
+OTU_phylum <- assay(metaphlan_phylum_tse, "counts")[,sample_names]
+metaphlan_beta.div.phylum <- rbiom::beta.div(OTU_phylum, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.phylum <- apply(as.matrix(metaphlan_beta.div.phylum), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.phylum <- metaphlan_uniqueness.phylum %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+```
+
+## Bracken: calculate bray curtis index and uniqueness
+
+```{r bracken BC}
+#taxa diversity for species
+bracken_species_tse <- altExp(bracken_tse,"species")
+OTU_species <- assay(bracken_species_tse, "counts")[,sample_names]
+bracken_beta.div.species <- rbiom::beta.div(OTU_species, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.species <- apply(as.matrix(bracken_beta.div.species), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.species <- bracken_uniqueness.species %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for genus
+bracken_genus_tse <- altExp(bracken_tse,"genus")
+OTU_genus <- assay(bracken_genus_tse, "counts")[,sample_names]
+bracken_beta.div.genus <- rbiom::beta.div(OTU_genus, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.genus <- apply(as.matrix(bracken_beta.div.genus), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.genus <- bracken_uniqueness.genus %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for family
+bracken_family_tse <- altExp(bracken_tse,"family")
+OTU_family <- assay(bracken_family_tse, "counts")[,sample_names]
+bracken_beta.div.family <- rbiom::beta.div(OTU_family, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.family <- apply(as.matrix(bracken_beta.div.family), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.family <- bracken_uniqueness.family %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for order
+bracken_order_tse <- altExp(bracken_tse,"order")
+OTU_order <- assay(bracken_order_tse, "counts")[,sample_names]
+bracken_beta.div.order <- rbiom::beta.div(OTU_order, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.order <- apply(as.matrix(bracken_beta.div.order), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.order <- bracken_uniqueness.order %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for class
+bracken_class_tse <- altExp(bracken_tse,"class")
+OTU_class <- assay(bracken_class_tse, "counts")[,sample_names]
+bracken_beta.div.class <- rbiom::beta.div(OTU_class, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.class <- apply(as.matrix(bracken_beta.div.class), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.class <- bracken_uniqueness.class %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for phylum
+bracken_phylum_tse <- altExp(bracken_tse,"phylum")
+OTU_phylum <- assay(bracken_phylum_tse, "counts")[,sample_names]
+bracken_beta.div.phylum <- rbiom::beta.div(OTU_phylum, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.phylum <- apply(as.matrix(bracken_beta.div.phylum), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.phylum <- bracken_uniqueness.phylum %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+```
+
+
+# Species
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#species level
+metaphlan_dist_matrix.species <- as.matrix(metaphlan_beta.div.species)
+samp.dat.species <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.species),])
+
+pm.species<-adonis2(metaphlan_dist_matrix.species~as.integer(samp.dat.species$c_age_years), data=samp.dat.species, permutations=999, by="margin")
+pm.species
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#species level
+bracken_dist_matrix.species <- as.matrix(bracken_beta.div.species)
+samp.dat.species <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.species),])
+
+pm.species<-adonis2(bracken_dist_matrix.species~as.integer(samp.dat.species$c_age_years), data=samp.dat.species, permutations=999, by="margin")
+pm.species
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.species <- mantel(metaphlan_beta.div.species, bracken_beta.div.species, method="pearson", permutations=999)
+mantel.species
+```
+
+
+# Genus
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#genus level
+metaphlan_dist_matrix.genus <- as.matrix(metaphlan_beta.div.genus)
+samp.dat.genus <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.genus),])
+
+pm.genus<-adonis2(metaphlan_dist_matrix.genus~as.integer(samp.dat.genus$c_age_years), data=samp.dat.genus, permutations=999, by="margin")
+pm.genus
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#genus level
+bracken_dist_matrix.genus <- as.matrix(bracken_beta.div.genus)
+samp.dat.genus <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.genus),])
+
+pm.genus<-adonis2(bracken_dist_matrix.genus~as.integer(samp.dat.genus$c_age_years), data=samp.dat.genus, permutations=999, by="margin")
+pm.genus
+```
+
+## Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.genus <- mantel(metaphlan_beta.div.genus, bracken_beta.div.genus, method="pearson", permutations=999)
+mantel.genus
+```
+
+# Family
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#family level
+metaphlan_dist_matrix.family <- as.matrix(metaphlan_beta.div.family)
+samp.dat.family <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.family),])
+
+pm.family<-adonis2(metaphlan_dist_matrix.family~as.integer(samp.dat.family$c_age_years), data=samp.dat.family, permutations=999, by="margin")
+pm.family
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#family level
+bracken_dist_matrix.family <- as.matrix(bracken_beta.div.family)
+samp.dat.family <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.family),])
+
+pm.family<-adonis2(bracken_dist_matrix.family~as.integer(samp.dat.family$c_age_years), data=samp.dat.family, permutations=999, by="margin")
+pm.family
+```
+
+## Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.family <- mantel(metaphlan_beta.div.family, bracken_beta.div.family, method="pearson", permutations=999)
+mantel.family
+```
+
+# Order
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#order level
+metaphlan_dist_matrix.order <- as.matrix(metaphlan_beta.div.order)
+samp.dat.order <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.order),])
+
+pm.order<-adonis2(metaphlan_dist_matrix.order~as.integer(samp.dat.order$c_age_years), data=samp.dat.order, permutations=999, by="margin")
+pm.order
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#order level
+bracken_dist_matrix.order <- as.matrix(bracken_beta.div.order)
+samp.dat.order <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.order),])
+
+pm.order<-adonis2(bracken_dist_matrix.order~as.integer(samp.dat.order$c_age_years), data=samp.dat.order, permutations=999, by="margin")
+pm.order
+```
+
+## Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.order <- mantel(metaphlan_beta.div.order, bracken_beta.div.order, method="pearson", permutations=999)
+mantel.order
+```
+
+# Class
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#class level
+metaphlan_dist_matrix.class <- as.matrix(metaphlan_beta.div.class)
+samp.dat.class <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.class),])
+
+pm.class<-adonis2(metaphlan_dist_matrix.class~as.integer(samp.dat.class$c_age_years), data=samp.dat.class, permutations=999, by="margin")
+pm.class
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#class level
+bracken_dist_matrix.class <- as.matrix(bracken_beta.div.class)
+samp.dat.class <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.class),])
+
+pm.class<-adonis2(bracken_dist_matrix.class~as.integer(samp.dat.class$c_age_years), data=samp.dat.class, permutations=999, by="margin")
+pm.class
+```
+
+## Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.class <- mantel(metaphlan_beta.div.class, bracken_beta.div.class, method="pearson", permutations=999)
+mantel.class
+```
+
+# Phylum
+
+## Metaphlan
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#phylum level
+metaphlan_dist_matrix.phylum <- as.matrix(metaphlan_beta.div.phylum)
+samp.dat.phylum <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.phylum),])
+
+pm.phylum<-adonis2(metaphlan_dist_matrix.phylum~as.integer(samp.dat.phylum$c_age_years), data=samp.dat.phylum, permutations=999, by="margin")
+pm.phylum
+```
+
+
+## Bracken
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#phylum level
+bracken_dist_matrix.phylum <- as.matrix(bracken_beta.div.phylum)
+samp.dat.phylum <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.phylum),])
+
+pm.phylum<-adonis2(bracken_dist_matrix.phylum~as.integer(samp.dat.phylum$c_age_years), data=samp.dat.phylum, permutations=999, by="margin")
+pm.phylum
+```
+
+## Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.phylum <- mantel(metaphlan_beta.div.phylum, bracken_beta.div.phylum, method = "pearson", permutations = 999)
+mantel.phylum
+```
+
+# Visualize Mantel test results
+
+## For all taxonomic levels
+
+```{r, fig.dim=c(25,5)}
+
+# create tibble with all results
+mantel.res <- tibble(
+    taxonomic_level = factor(c('Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species'), levels=c('Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')),
+    correlation = c(mantel.phylum$statistic, 
+                    mantel.class$statistic, 
+                    mantel.order$statistic, 
+                    mantel.family$statistic, 
+                    mantel.genus$statistic, 
+                    mantel.species$statistic),
+    p_value = c(mantel.phylum$signif,
+                mantel.class$signif, 
+                mantel.order$signif,
+                mantel.family$signif, 
+                mantel.genus$signif, 
+                mantel.species$signif)
+)
+
+# Create the scatter plot
+p.mantel <- ggplot(mantel.res, aes(x = taxonomic_level, y = correlation)) +
+    geom_bar(stat = "identity", width=0.5) + 
+  ylim(0,1) +
+    labs(title = "Overall profile comparison: MetaPhlAn4 vs. Bracken",
+         y = "correlation coefficient",
+         x = "taxonomic level") +
+  geom_signif(y_position = c(0.95, 0.95, 0.95, 0.95, 0.95, 0.95), 
+              xmin = c(0.8, 1.8, 2.8, 3.8, 4.8, 5.8), 
+              xmax = c(1.2, 2.2, 3.2, 4.2, 5.2, 6.2),
+              annotation=paste0("p=",mantel.res$p_value), 
+              tip_length=0) +
+    theme_bw(base_size = 20) +
+  theme(axis.title.x=element_blank())
+
+p.mantel
+
+#create directory
+dir.create(paste0(outpath,"Figures/all_taxa_method_comparison"))
+
+#save figure
+png(paste0(outpath,"Figures/all_taxa_method_comparison/mantel_test_all.taxa_chinese_alllevels.png"), units="in", width=20, height=5, res=300)
+p.mantel
+dev.off()
+```
+
+## For phylum, genus, species level 
+
+```{r, fig.dim=c(15,5)}
+
+# create tibble with all results
+mantel.res <- tibble(
+    taxonomic_level = factor(c('Phylum', 'Genus', 'Species'), levels=c('Phylum', 'Genus', 'Species')),
+    correlation = c(mantel.phylum$statistic, 
+                    mantel.genus$statistic, 
+                    mantel.species$statistic),
+    p_value = c(mantel.phylum$signif,
+                mantel.genus$signif, 
+                mantel.species$signif)
+)
+
+# Create the scatter plot
+p.mantel <- ggplot(mantel.res, aes(x = taxonomic_level, y = correlation)) +
+    geom_bar(stat = "identity", width=0.5) + 
+  ylim(0,1) +
+    labs(title = "Overall profile comparison: MetaPhlAn4 vs. Bracken",
+         y = "correlation coefficient",
+         x = "taxonomic level") +
+  geom_signif(y_position = c(0.95, 0.95, 0.95), 
+              xmin = c(0.8, 1.8, 2.8), 
+              xmax = c(1.2, 2.2, 3.2),
+              annotation=paste0("p=",mantel.res$p_value), 
+              tip_length=0) +
+    theme_bw(base_size = 20) +
+  theme(axis.title.x=element_blank())
+
+p.mantel
+
+png(paste0(outpath,"Figures/all_taxa_method_comparison/mantel_test_all.taxa_chinese_main.png"), units="in", width=10, height=5, res=300)
+p.mantel
+dev.off()
+```
+

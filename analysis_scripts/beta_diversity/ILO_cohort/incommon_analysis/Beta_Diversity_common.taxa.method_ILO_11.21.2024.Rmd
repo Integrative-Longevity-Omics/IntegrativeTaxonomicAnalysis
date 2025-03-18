@@ -1,0 +1,1717 @@
+---
+title: "Beta diversity analysis with ILO cohort data based in-common taxa between taxonomic classification methods"
+author: "Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: paper
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(dynamicTreeCut)
+#microbiome and single cell specific packages
+library(vegan)
+library(mia)
+library(scater)
+#write excel sheets
+library(writexl)
+library(RColorBrewer)
+
+#specify file path
+flpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/processed_data/data_library/"
+qcpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_comined_cohort/processed_data/qc_analysis/"
+outpath <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/02_beta_diversity_analysis/ILO_cohort/output/"
+meta.dir <-"/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/decoder/archived/"
+
+#metaphlan data
+metaphlan_otufl <- "metaphlan4_renorm_ILO_phyloseq.09.30.2024.rds"
+#bracken data with log10 read count threshold 1 and unique kmer minimizer count threshold 3
+bracken_otufl <- "bracken_renorm_ILO_phyloseq.R1.K3.10.09.2024.rds"
+
+#metadata
+phenofl <- "2024-11-18.cleaned.metag.list.csv"
+
+#set seed
+set.seed(157)
+
+```
+
+# Functions
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    select(c(tax.name, biom_samplenames)) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+# Read in phenotypic data
+
+```{r}
+pheno.data <- read_csv(paste0(meta.dir,phenofl) ) %>%
+  dplyr::mutate(Sample=stool_kit)
+
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+```
+
+
+# Metaphlan4: Read in phenotype data and phyloseq object
+```{r metaphlan data}
+#load phyloseq obj
+metaphlan_ilo_biom <- readRDS(paste0(flpath, metaphlan_otufl))
+
+#add phenotypic data to phyloseq object
+metaphlan_ilo_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+metaphlan_ilo_biom <- subset_samples(metaphlan_ilo_biom, !is.na(Age_at_FecalSample))
+
+metaphlan.sample.meta <- sample_data(metaphlan_ilo_biom) %>% 
+  as_tibble(rownames="stool_kit")
+# metaphlan.samples <- metaphlan.sample.meta %>% dplyr::select(sample.ID, stool_kit)
+  
+OTU_metaphlan <- metaphlan_ilo_biom@otu_table@.Data
+# colnames(OTU_metaphlan) <- metaphlan.samples$stool_kit
+TAX_metaphlan <- metaphlan_ilo_biom@tax_table@.Data
+
+#save sample data for permanova
+# rownames(metaphlan_ilo_biom@sam_data) <- metaphlan_ilo_biom@sam_data$stool_kit
+# sample_names(metaphlan_ilo_biom) <- metaphlan_ilo_biom@sam_data$stool_kit
+metaphlan.samp.dat <- data.frame(metaphlan_ilo_biom@sam_data)
+
+```
+
+## Bracken: Read in phenotype data and phyloseq object
+```{r bracken data}
+#load phyloseq obj
+bracken_ilo_biom <- readRDS(paste0(flpath, bracken_otufl))
+
+#add phenotypic data to phyloseq object
+bracken_ilo_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+bracken_ilo_biom <- subset_samples(bracken_ilo_biom, !is.na(Age_at_FecalSample))
+
+bracken.sample.meta <- sample_data(bracken_ilo_biom) %>%
+  as_tibble(rownames="stool_kit")
+# bracken.samples <- bracken.sample.meta %>% dplyr::select(sample.ID, stool_kit)
+
+#calculate relative abundances
+OTU_bracken <- bracken_ilo_biom@otu_table@.Data
+TAX_bracken <- bracken_ilo_biom@tax_table@.Data
+
+#save sample data for permanova
+# rownames(bracken_ilo_biom@sam_data) <- bracken_ilo_biom@sam_data$stool_kit
+# sample_names(bracken_ilo_biom) <- bracken_ilo_biom@sam_data$stool_kit
+bracken.samp.dat <- data.frame(bracken_ilo_biom@sam_data)
+
+```
+
+## common samples
+
+```{r}
+#metaphlan
+metaphlan.sample.meta <- metaphlan.sample.meta %>% dplyr::filter(metaphlan.sample.meta$stool_kit %in% bracken.sample.meta$stool_kit)
+dim(metaphlan.sample.meta)
+
+OTU_metaphlan <- OTU_metaphlan[, metaphlan.sample.meta$stool_kit]
+dim(OTU_metaphlan)
+
+#bracken
+bracken.sample.meta <- bracken.sample.meta %>% dplyr::filter(bracken.sample.meta$stool_kit %in% metaphlan.sample.meta$stool_kit)
+dim(bracken.sample.meta)
+
+OTU_bracken <- OTU_bracken[, bracken.sample.meta$stool_kit]
+dim(OTU_bracken)
+
+#make sure to have the same order of samples
+sample_names <- unique(colnames(OTU_bracken), colnames(OTU_metaphlan))
+```
+
+# Filter to common taxa and renormalize data
+
+```{r common taxa}
+#adjust taxa table
+#move rownames to column variable tax.ID
+metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+bracken_ilo_biom.taxa <- bracken_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+#combine taxa tables based keeping common taxa using inner_join
+common_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_ilo_biom.taxa, by= c("tax.ID")) 
+dim(common_taxa_total)
+
+metaphlan_taxa_total <- common_taxa_total %>% dplyr::select(tax.ID:Species) %>% column_to_rownames(var = "tax.ID")
+bracken_taxa_total <- common_taxa_total %>% dplyr::select(tax.ID, kingdom:species) %>% column_to_rownames(var = "tax.ID")
+dim(metaphlan_taxa_total)
+dim(bracken_taxa_total)
+
+#combine taxa tables based keeping common taxa using inner_join
+filtered_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_ilo_biom.taxa, by= c("tax.ID")) %>%
+  dplyr::select(tax.ID, kingdom:species) %>%
+                  column_to_rownames(var = "tax.ID")
+dim(filtered_taxa_total)
+
+#subset otu table for common taxa
+metaphlan_ilo_biom.otu <- OTU_metaphlan[rownames(metaphlan_taxa_total),] %>% as.matrix()
+bracken_ilo_biom.otu <- OTU_bracken[rownames(bracken_taxa_total),] %>% as.matrix()
+
+#renormalize metaphlan data
+metaphlan_ilo_renorm.otu <- t(t(metaphlan_ilo_biom.otu)/colSums(metaphlan_ilo_biom.otu))
+#renormalize bracken data
+bracken_ilo_renorm.otu <- t(t(bracken_ilo_biom.otu)/colSums(bracken_ilo_biom.otu))
+
+```
+
+```{r}
+#save as tibbles
+metaphlan_ilo_renorm.t <- metaphlan_ilo_renorm.otu %>% as_tibble(rownames="tax.ID")
+bracken_ilo_renorm.t <- bracken_ilo_renorm.otu %>% as_tibble(rownames="tax.ID")
+
+#metphlan phyloseq obj
+metaphlan.common.phy <- phyloseq::phyloseq(otu_table(metaphlan_ilo_renorm.otu, taxa_are_rows = TRUE), tax_table(metaphlan_taxa_total %>% as.matrix),  sample_data(metaphlan.samp.dat))
+metaphlan.common.phy
+
+#bracken phyloseq obj
+bracken.common.phy <- phyloseq::phyloseq(otu_table(bracken_ilo_renorm.otu, taxa_are_rows = TRUE), tax_table(bracken_taxa_total %>% as.matrix),  sample_data(bracken.samp.dat))
+bracken.common.phy
+```
+
+
+# Beta diversity across taxonomic hierarchy
+
+## Metaphlan: Create Tree Summarized Experiment object from Phyloseq object 
+
+```{r metaphlan tse}
+#convert phyloseq object to a tree summarized experiment object
+metaphlan_tse <- mia::makeTreeSummarizedExperimentFromPhyloseq(metaphlan.common.phy)
+metaphlan_tse
+
+
+#agglomerate based on each taxonomic rank and save as alternative assays in the object
+altExps(metaphlan_tse) <- mia::splitByRanks(metaphlan_tse)
+metaphlan_tse
+
+
+```
+
+## Bracken: Create Tree Summarized Experiment object from Phyloseq object 
+
+```{r bracken tse}
+#convert phyloseq object to a tree summarized experiment object
+bracken_tse <- mia::makeTreeSummarizedExperimentFromPhyloseq(bracken.common.phy)
+bracken_tse
+
+
+#agglomerate based on each taxonomic rank and save as alternative assays in the object
+altExps(bracken_tse) <- mia::splitByRanks(bracken_tse)
+bracken_tse
+
+
+```
+
+## Metaphlan: calculate bray curtis index and uniqueness
+
+```{r metaphlan BC}
+#taxa diversity for species
+metaphlan_species_tse <- altExp(metaphlan_tse,"Species")
+OTU_species <- assay(metaphlan_species_tse, "counts")[,sample_names]
+metaphlan_beta.div.species <- rbiom::beta.div(OTU_species, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.species <- apply(as.matrix(metaphlan_beta.div.species), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.species <- metaphlan_uniqueness.species %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for genus
+metaphlan_genus_tse <- altExp(metaphlan_tse,"Genus")
+OTU_genus <- assay(metaphlan_genus_tse, "counts")[,sample_names]
+metaphlan_beta.div.genus <- rbiom::beta.div(OTU_genus, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.genus <- apply(as.matrix(metaphlan_beta.div.genus), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.genus <- metaphlan_uniqueness.genus %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for family
+metaphlan_family_tse <- altExp(metaphlan_tse,"Family")
+OTU_family <- assay(metaphlan_family_tse, "counts")[,sample_names]
+metaphlan_beta.div.family <- rbiom::beta.div(OTU_family, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.family <- apply(as.matrix(metaphlan_beta.div.family), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.family <- metaphlan_uniqueness.family %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for order
+metaphlan_order_tse <- altExp(metaphlan_tse,"Order")
+OTU_order <- assay(metaphlan_order_tse, "counts")[,sample_names]
+metaphlan_beta.div.order <- rbiom::beta.div(OTU_order, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.order <- apply(as.matrix(metaphlan_beta.div.order), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.order <- metaphlan_uniqueness.order %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for class
+metaphlan_class_tse <- altExp(metaphlan_tse,"Class")
+OTU_class <- assay(metaphlan_class_tse, "counts")[,sample_names]
+metaphlan_beta.div.class <- rbiom::beta.div(OTU_class, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.class <- apply(as.matrix(metaphlan_beta.div.class), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.class <- metaphlan_uniqueness.class %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+#taxa diversity for phylum
+metaphlan_phylum_tse <- altExp(metaphlan_tse,"Phylum")
+OTU_phylum <- assay(metaphlan_phylum_tse, "counts")[,sample_names]
+metaphlan_beta.div.phylum <- rbiom::beta.div(OTU_phylum, method="bray-curtis", weighted=TRUE)
+metaphlan_uniqueness.phylum <- apply(as.matrix(metaphlan_beta.div.phylum), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+metaphlan_b.phylum <- metaphlan_uniqueness.phylum %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by = "stool_kit")
+
+```
+
+### Save bray-curtis distances
+
+```{r}
+#save pair-wise distances information to excel file
+BC_list <- list(
+  BC.phylum = as_tibble(as.matrix(metaphlan_beta.div.phylum), rownames="sample.ID"),
+  BC.class = as_tibble(as.matrix(metaphlan_beta.div.class), rownames="sample.ID"),
+  BC.order = as_tibble(as.matrix(metaphlan_beta.div.order), rownames="sample.ID"),
+  BC.family = as_tibble(as.matrix(metaphlan_beta.div.family), rownames="sample.ID"),
+  BC.genus = as_tibble(as.matrix(metaphlan_beta.div.genus), rownames="sample.ID"),
+  BC.species = as_tibble(as.matrix(metaphlan_beta.div.species), rownames="sample.ID")
+  )
+
+write_xlsx(BC_list, paste0(outpath,"BC_metaphlan.commontaxa_ILO.xlsx"))
+```
+
+
+## Bracken: calculate bray curtis index and uniqueness
+
+```{r bracken BC}
+#taxa diversity for species
+bracken_species_tse <- altExp(bracken_tse,"species")
+OTU_species <- assay(bracken_species_tse, "counts")[,sample_names]
+bracken_beta.div.species <- rbiom::beta.div(OTU_species, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.species <- apply(as.matrix(bracken_beta.div.species), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.species <- bracken_uniqueness.species %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for genus
+bracken_genus_tse <- altExp(bracken_tse,"genus")
+OTU_genus <- assay(bracken_genus_tse, "counts")[,sample_names]
+bracken_beta.div.genus <- rbiom::beta.div(OTU_genus, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.genus <- apply(as.matrix(bracken_beta.div.genus), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.genus <- bracken_uniqueness.genus %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for family
+bracken_family_tse <- altExp(bracken_tse,"family")
+OTU_family <- assay(bracken_family_tse, "counts")[,sample_names]
+bracken_beta.div.family <- rbiom::beta.div(OTU_family, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.family <- apply(as.matrix(bracken_beta.div.family), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.family <- bracken_uniqueness.family %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for order
+bracken_order_tse <- altExp(bracken_tse,"order")
+OTU_order <- assay(bracken_order_tse, "counts")[,sample_names]
+bracken_beta.div.order <- rbiom::beta.div(OTU_order, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.order <- apply(as.matrix(bracken_beta.div.order), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.order <- bracken_uniqueness.order %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for class
+bracken_class_tse <- altExp(bracken_tse,"class")
+OTU_class <- assay(bracken_class_tse, "counts")[,sample_names]
+bracken_beta.div.class <- rbiom::beta.div(OTU_class, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.class <- apply(as.matrix(bracken_beta.div.class), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.class <- bracken_uniqueness.class %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+
+#taxa diversity for phylum
+bracken_phylum_tse <- altExp(bracken_tse,"phylum")
+OTU_phylum <- assay(bracken_phylum_tse, "counts")[,sample_names]
+bracken_beta.div.phylum <- rbiom::beta.div(OTU_phylum, method="bray-curtis", weighted=TRUE)
+bracken_uniqueness.phylum <- apply(as.matrix(bracken_beta.div.phylum), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+bracken_b.phylum <- bracken_uniqueness.phylum %>% as_tibble(rownames="stool_kit") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(bracken.sample.meta, by = "stool_kit")
+```
+
+
+### Save bray-curtis distances
+
+```{r}
+#save pair-wise distances information to excel file
+BC_list <- list(
+  BC.phylum = as_tibble(as.matrix(bracken_beta.div.phylum), rownames="sample.ID"),
+  BC.class = as_tibble(as.matrix(bracken_beta.div.class), rownames="sample.ID"),
+  BC.order = as_tibble(as.matrix(bracken_beta.div.order), rownames="sample.ID"),
+  BC.family = as_tibble(as.matrix(bracken_beta.div.family), rownames="sample.ID"),
+  BC.genus = as_tibble(as.matrix(bracken_beta.div.genus), rownames="sample.ID"),
+  BC.species = as_tibble(as.matrix(bracken_beta.div.species), rownames="sample.ID")
+  )
+
+write_xlsx(BC_list, paste0(outpath,"BC_bracken.commontaxa_ILO.xlsx"))
+```
+
+# Metaphlan: Uniqueness
+
+```{r metaphlan uniqueness, fig.dim = c(20,10)}
+p.s_age <- ggplot(metaphlan_b.species, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species") 
+    
+
+#For genus level
+p.g_age <- ggplot(metaphlan_b.genus, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) +
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus") 
+    
+
+#For family level
+p.f_age <- ggplot(metaphlan_b.family, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family") 
+    
+
+
+#For order level
+p.o_age <- ggplot(metaphlan_b.order, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order")
+
+
+#For class level
+p.c_age <- ggplot(metaphlan_b.class, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class")
+
+
+#For phylum level
+p.p_age <- ggplot(metaphlan_b.phylum, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum")
+
+
+#Plot together in one panel
+ggpubr::ggarrange(p.p_age, p.c_age, p.o_age, p.f_age, p.g_age, p.s_age, 
+          ncol = 6, nrow = 1)
+
+```
+
+# Bracken: Uniqueness
+
+```{r bracken uniqueness, fig.dim = c(20,10)}
+p.s_age <- ggplot(bracken_b.species, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species") 
+    
+
+#For genus level
+p.g_age <- ggplot(bracken_b.genus, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) +
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus") 
+    
+
+#For family level
+p.f_age <- ggplot(bracken_b.family, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family") 
+    
+
+
+#For order level
+p.o_age <- ggplot(bracken_b.order, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order")
+
+
+#For class level
+p.c_age <- ggplot(bracken_b.class, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class")
+
+
+#For phylum level
+p.p_age <- ggplot(bracken_b.phylum, aes(x=Age_at_FecalSample, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum")
+
+
+#Plot together in one panel
+ggpubr::ggarrange(p.p_age, p.c_age, p.o_age, p.f_age, p.g_age, p.s_age, 
+          ncol = 6, nrow = 1)
+
+```
+
+# Ranking based on uniqueness
+
+```{r rankings, eval = FALSE}
+#save sample uniqueness across taxonomic levels from metaphlan data
+metaphlan.uniqueness <- list(phylum.uniqueness = metaphlan_b.class %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     class.uniqueness = metaphlan_b.phylum %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     order.uniqueness = metaphlan_b.order %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     family.uniqueness = metaphlan_b.family %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     genus.uniqueness = metaphlan_b.genus %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     species.uniqueness = metaphlan_b.species %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness)
+)
+saveRDS(metaphlan.uniqueness, paste0(outpath,"metaphlan.ilo.commontaxa.bc.uniqueness.rds"))
+
+#save sample uniqueness across taxonomic levels from bracken data
+bracken.uniqueness <- list(phylum.uniqueness = bracken_b.class %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     class.uniqueness = bracken_b.phylum %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     order.uniqueness = bracken_b.order %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     family.uniqueness = bracken_b.family %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     genus.uniqueness = bracken_b.genus %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness),
+     species.uniqueness = bracken_b.species %>% dplyr::select(stool_kit, uniqueness) %>% arrange(uniqueness)
+)
+saveRDS(bracken.uniqueness, paste0(outpath,"bracken.ilo.commontaxa.bc.uniqueness.rds"))
+```
+
+
+# Species
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+
+```{r metaphlan species, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.species)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+#column.anno <- HeatmapAnnotation(
+    # Age = samp.dat.ordered$Label,
+    # col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+    # )
+
+#row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+    # col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+h.species <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white")
+                                     #, bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.species <- draw(h.species, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#species level
+metaphlan_dist_matrix.species <- as.matrix(metaphlan_beta.div.species)
+samp.dat.species <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.species),])
+
+pm.metaphlan.species<-adonis2(metaphlan_dist_matrix.species~as.integer(samp.dat.species$Age_at_FecalSample), data=samp.dat.species, permutations=999, by="margin")
+pm.metaphlan.species
+```
+
+
+## Bracken
+### Heatmap of bray curtis distances
+
+```{r bracken species, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.species)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+h.species <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white")
+#bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.species <- draw(h.species, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#species level
+bracken_dist_matrix.species <- as.matrix(bracken_beta.div.species)
+samp.dat.species <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.species),])
+
+pm.bracken.species<-adonis2(bracken_dist_matrix.species~as.integer(samp.dat.species$Age_at_FecalSample), data=samp.dat.species, permutations=999, by="margin")
+pm.bracken.species
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.species <- mantel(metaphlan_beta.div.species, bracken_beta.div.species, method="pearson", permutations=999)
+mantel.species
+```
+
+
+# Genus
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+```{r metaphlan genus, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.genus)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.genus <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white")
+#bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.genus <- draw(h.genus, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#genus level
+metaphlan_dist_matrix.genus <- as.matrix(metaphlan_beta.div.genus)
+samp.dat.genus <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.genus),])
+
+pm.metaphlan.genus<-adonis2(metaphlan_dist_matrix.genus~as.integer(samp.dat.genus$Age_at_FecalSample), data=samp.dat.genus, permutations=999, by="margin")
+pm.metaphlan.genus
+```
+
+
+## Bracken
+
+### Heatmap of bray curtis distances
+
+```{r bracken genus, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.genus)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.genus <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white")
+#bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.genus <- draw(h.genus, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#genus level
+bracken_dist_matrix.genus <- as.matrix(bracken_beta.div.genus)
+samp.dat.genus <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.genus),])
+
+pm.bracken.genus<-adonis2(bracken_dist_matrix.genus~as.integer(samp.dat.genus$Age_at_FecalSample), data=samp.dat.genus, permutations=999, by="margin")
+pm.bracken.genus
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.genus <- mantel(metaphlan_beta.div.genus, bracken_beta.div.genus, method="pearson", permutations=999)
+mantel.genus
+```
+
+# Family
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+
+
+```{r metaphlan family, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.family)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+# 
+
+
+h.family <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.family <- draw(h.family, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#family level
+metaphlan_dist_matrix.family <- as.matrix(metaphlan_beta.div.family)
+samp.dat.family <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.family),])
+
+pm.metaphlan.family<-adonis2(metaphlan_dist_matrix.family~as.integer(samp.dat.family$Age_at_FecalSample), data=samp.dat.family, permutations=999, by="margin")
+pm.metaphlan.family
+```
+
+
+## Bracken
+
+### Heatmap of bray curtis distances
+
+
+```{r bracken family, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.family)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.family <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.family <- draw(h.family, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#family level
+bracken_dist_matrix.family <- as.matrix(bracken_beta.div.family)
+samp.dat.family <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.family),])
+
+pm.bracken.family<-adonis2(bracken_dist_matrix.family~as.integer(samp.dat.family$Age_at_FecalSample), data=samp.dat.family, permutations=999, by="margin")
+pm.bracken.family
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.family <- mantel(metaphlan_beta.div.family, bracken_beta.div.family, method="pearson", permutations=999)
+mantel.family
+```
+
+# Order
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+
+
+```{r metaphlan order, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.order)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.order <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.order <- draw(h.order, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#order level
+metaphlan_dist_matrix.order <- as.matrix(metaphlan_beta.div.order)
+samp.dat.order <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.order),])
+
+pm.metaphlan.order<-adonis2(metaphlan_dist_matrix.order~as.integer(samp.dat.order$Age_at_FecalSample), data=samp.dat.order, permutations=999, by="margin")
+pm.metaphlan.order
+```
+
+
+## Bracken
+
+### Heatmap of bray curtis distances
+
+```{r bracken order, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.order)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.ordered <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.ordered$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.order <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.order <- draw(h.order, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#order level
+bracken_dist_matrix.order <- as.matrix(bracken_beta.div.order)
+samp.dat.order <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.order),])
+
+pm.bracken.order<-adonis2(bracken_dist_matrix.order~as.integer(samp.dat.order$Age_at_FecalSample), data=samp.dat.order, permutations=999, by="margin")
+pm.bracken.order
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.order <- mantel(metaphlan_beta.div.order, bracken_beta.div.order, method="pearson", permutations=999)
+mantel.order
+```
+
+# Class
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+
+```{r metaphlan class, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.class)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.classed <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.classed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.classed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.class <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.class <- draw(h.class, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#class level
+metaphlan_dist_matrix.class <- as.matrix(metaphlan_beta.div.class)
+samp.dat.class <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.class),])
+
+pm.metaphlan.class<-adonis2(metaphlan_dist_matrix.class~as.integer(samp.dat.class$Age_at_FecalSample), data=samp.dat.class, permutations=999, by="margin")
+pm.metaphlan.class
+```
+
+
+## Bracken
+
+### Heatmap of bray curtis distances
+
+```{r bracken class, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.class)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.classed <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.classed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.classed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.class <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.class <- draw(h.class, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#class level
+bracken_dist_matrix.class <- as.matrix(bracken_beta.div.class)
+samp.dat.class <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.class),])
+
+pm.bracken.class<-adonis2(bracken_dist_matrix.class~as.integer(samp.dat.class$Age_at_FecalSample), data=samp.dat.class, permutations=999, by="margin")
+pm.bracken.class
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.class <- mantel(metaphlan_beta.div.class, bracken_beta.div.class, method="pearson", permutations=999)
+mantel.class
+```
+
+# Phylum
+
+## Metaphlan
+
+### Heatmap of bray curtis distances
+
+```{r metaphlan phylum, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(metaphlan_beta.div.phylum)
+
+#Complex heatmap
+
+samp.dat <- metaphlan.common.phy@sam_data
+samp.dat.phylumed <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.phylumed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.phylumed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.phylum <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.phylum <- draw(h.phylum, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(metaphlan.samp.dat)
+#phylum level
+metaphlan_dist_matrix.phylum <- as.matrix(metaphlan_beta.div.phylum)
+samp.dat.phylum <- as.data.frame(samp.dat[rownames(metaphlan_dist_matrix.phylum),])
+
+pm.metaphlan.phylum<-adonis2(metaphlan_dist_matrix.phylum~as.integer(samp.dat.phylum$Age_at_FecalSample), data=samp.dat.phylum, permutations=999, by="margin")
+pm.metaphlan.phylum
+```
+
+
+## Bracken
+
+### Heatmap of bray curtis distances
+
+```{r bracken phylum, fig.dim = c(15,15)}
+D.ilo.otu.mat <- as.matrix(bracken_beta.div.phylum)
+
+#Complex heatmap
+
+samp.dat <- bracken.common.phy@sam_data
+samp.dat.phylumed <- samp.dat[rownames(D.ilo.otu.mat),]
+
+# column.anno <- HeatmapAnnotation(
+#     Age = samp.dat.phylumed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon"))
+#     )
+# 
+# row.anno <- rowAnnotation(Age = samp.dat.phylumed$Label,
+#     col = list(Age = c("Age < 100" = "blue2", "Age >= 100" = "maroon")))
+
+
+
+h.phylum <- ComplexHeatmap::Heatmap(D.ilo.otu.mat, cluster_rows = T, cluster_columns = T, name = "Bray Curtis Index", show_row_names = F, show_column_names = F, row_names_gp = gpar(fontsize = 10), na_col = "white") #bottom_annotation = column.anno, right_annotation = row.anno)
+
+
+h.phylum <- draw(h.phylum, merge_legend = TRUE, heatmap_legend_side = "top", annotation_legend_side = "top")
+
+```
+
+### PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(bracken.samp.dat)
+#phylum level
+bracken_dist_matrix.phylum <- as.matrix(bracken_beta.div.phylum)
+samp.dat.phylum <- as.data.frame(samp.dat[rownames(bracken_dist_matrix.phylum),])
+
+pm.bracken.phylum<-adonis2(bracken_dist_matrix.phylum~as.integer(samp.dat.phylum$Age_at_FecalSample), data=samp.dat.phylum, permutations=999, by="margin")
+pm.bracken.phylum
+```
+
+### Mantel Test: test how similar the distance matrices are
+```{r}
+mantel.phylum <- mantel(metaphlan_beta.div.phylum, bracken_beta.div.phylum, method = "pearson", permutations = 999)
+mantel.phylum
+```
+# PCOA analysis: Metaphlan
+## PCOA of beta diversity distances across taxonomic levels
+
+```{r}
+#species
+pcoa.species <- ape::pcoa(metaphlan_beta.div.species)
+pcoa.species_variance_explained <- round(pcoa.species$values$Eigenvalues/sum(pcoa.species$values$Eigenvalues) * 100, 2)
+pcoa.species.join <- pcoa.species$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit")) 
+
+#genus
+pcoa.genus <- ape::pcoa(metaphlan_beta.div.genus)
+pcoa.genus_variance_explained <- round(pcoa.genus$values$Eigenvalues/sum(pcoa.genus$values$Eigenvalues) * 100, 2)
+pcoa.genus.join <- pcoa.genus$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#family
+pcoa.family <- ape::pcoa(metaphlan_beta.div.family)
+pcoa.family_variance_explained <- round(pcoa.family$values$Eigenvalues/sum(pcoa.family$values$Eigenvalues) * 100, 2)
+pcoa.family.join <- pcoa.family$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#order
+pcoa.order <- ape::pcoa(metaphlan_beta.div.order)
+pcoa.order_variance_explained <- round(pcoa.order$values$Eigenvalues/sum(pcoa.order$values$Eigenvalues) * 100, 2)
+pcoa.order.join <- pcoa.order$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#class
+pcoa.class <- ape::pcoa(metaphlan_beta.div.class)
+pcoa.class_variance_explained <- round(pcoa.class$values$Eigenvalues/sum(pcoa.class$values$Eigenvalues) * 100, 2)
+pcoa.class.join <- pcoa.class$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#phylum
+pcoa.phylum <- ape::pcoa(metaphlan_beta.div.phylum)
+pcoa.phylum_variance_explained <- round(pcoa.phylum$values$Eigenvalues/sum(pcoa.phylum$values$Eigenvalues) * 100, 2)
+pcoa.phylum.join <- pcoa.phylum$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(metaphlan.sample.meta, by=c("sample.ID"="stool_kit"))
+
+```
+
+## Save pcoa analysis results for PC1 and PC2
+
+```{r}
+#save pcoa information to excel file and rds
+pcoa_list <- list(
+  pcoa.phylum = pcoa.phylum.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.class = pcoa.class.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.order = pcoa.order.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.family = pcoa.family.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.genus = pcoa.genus.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.species = pcoa.species.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2)
+)
+saveRDS(pcoa_list, paste0(outpath,"pcoa_metaphlan4_common.taxa_ILO.rds"))
+write_xlsx(pcoa_list, paste0(outpath,"pcoa_metaphlan4_common.taxa_ILO.xlsx"))
+```
+
+
+## PCOA colored by age at fecal sample collection (continuous)
+
+```{r, fig.dim=c(30,20)}
+p.plot <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1.5, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) 
+p.legend <- p.plot %>% get_legend() %>% as_ggplot
+
+p.species <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Species" , 
+         subtitle=paste(paste0("F=",pm.metaphlan.species$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.species$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.species_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.species_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.7,0.5)
+    
+p.genus <- ggplot(pcoa.genus.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Genus", 
+         subtitle=paste(paste0("F=",pm.metaphlan.genus$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.genus$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.genus_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.genus_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.7,0.6)
+
+p.family <- ggplot(pcoa.family.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Family",
+         subtitle=paste(paste0("F=",pm.metaphlan.family$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.family$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.family_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.family_variance_explained[2], "%)")) +
+  ylim(-0.6,0.9) +
+  xlim(-0.7,0.8)
+
+p.order <- ggplot(pcoa.order.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Order",
+         subtitle=paste(paste0("F=",pm.metaphlan.order$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.order$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.order_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.order_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.class <- ggplot(pcoa.class.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Class",
+         subtitle=paste(paste0("F=",pm.metaphlan.class$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.class$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.class_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.class_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.phylum <- ggplot(pcoa.phylum.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Phylum",
+         subtitle=paste(paste0("F=",pm.metaphlan.phylum$F[1] %>% signif(3),","),
+                        paste0("p=",pm.metaphlan.phylum$`Pr(>F)`[1]))) +
+ scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.phylum_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.phylum_variance_explained[2], "%)")) +
+  ylim(-0.8,0.8) +
+  xlim(-0.5,0.8)
+
+
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+
+dir.create(paste0(outpath,"Figures/incommon_taxa"))
+png(paste0(outpath,"Figures/incommon_taxa/pcoa_bray_metaphlan_common.taxa_ilo_alllevels.png"), units="in", width=40, height=20, res=300)
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+dev.off()
+
+png(paste0(outpath,"Figures/incommon_taxa/pcoa_bray_metaphlan_common.taxa_ilo_main.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.phylum, p.genus, p.species, p.legend, ncol = 4, nrow = 1)
+dev.off()
+```
+
+# PCOA analysis: Bracken
+## PCOA of beta diversity distances across taxonomic levels
+
+```{r}
+#species
+pcoa.species <- ape::pcoa(bracken_beta.div.species)
+pcoa.species_variance_explained <- round(pcoa.species$values$Eigenvalues/sum(pcoa.species$values$Eigenvalues) * 100, 2)
+pcoa.species.join <- pcoa.species$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit")) 
+
+#genus
+pcoa.genus <- ape::pcoa(bracken_beta.div.genus)
+pcoa.genus_variance_explained <- round(pcoa.genus$values$Eigenvalues/sum(pcoa.genus$values$Eigenvalues) * 100, 2)
+pcoa.genus.join <- pcoa.genus$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#family
+pcoa.family <- ape::pcoa(bracken_beta.div.family)
+pcoa.family_variance_explained <- round(pcoa.family$values$Eigenvalues/sum(pcoa.family$values$Eigenvalues) * 100, 2)
+pcoa.family.join <- pcoa.family$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#order
+pcoa.order <- ape::pcoa(bracken_beta.div.order)
+pcoa.order_variance_explained <- round(pcoa.order$values$Eigenvalues/sum(pcoa.order$values$Eigenvalues) * 100, 2)
+pcoa.order.join <- pcoa.order$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#class
+pcoa.class <- ape::pcoa(bracken_beta.div.class)
+pcoa.class_variance_explained <- round(pcoa.class$values$Eigenvalues/sum(pcoa.class$values$Eigenvalues) * 100, 2)
+pcoa.class.join <- pcoa.class$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit"))
+
+#phylum
+pcoa.phylum <- ape::pcoa(bracken_beta.div.phylum)
+pcoa.phylum_variance_explained <- round(pcoa.phylum$values$Eigenvalues/sum(pcoa.phylum$values$Eigenvalues) * 100, 2)
+pcoa.phylum.join <- pcoa.phylum$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(bracken.sample.meta, by=c("sample.ID"="stool_kit"))
+
+```
+
+## Save pcoa analysis results for PC1 and PC2
+
+```{r}
+#save pcoa information to excel file and rds
+pcoa_list <- list(
+  pcoa.phylum = pcoa.phylum.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.class = pcoa.class.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.order = pcoa.order.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.family = pcoa.family.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.genus = pcoa.genus.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.species = pcoa.species.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2)
+)
+saveRDS(pcoa_list, paste0(outpath,"pcoa_bracken_common.taxa_ILO.rds"))
+write_xlsx(pcoa_list, paste0(outpath,"pcoa_bracken_common.taxa_ILO.xlsx"))
+```
+
+
+## PCOA colored by age at fecal sample collection (continuous)
+
+```{r, fig.dim=c(30,20)}
+p.plot <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1.5, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) 
+p.legend <- p.plot %>% get_legend() %>% as_ggplot
+
+p.species <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Species" , 
+         subtitle=paste(paste0("F=",pm.bracken.species$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.species$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.species_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.species_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.7,0.5)
+    
+p.genus <- ggplot(pcoa.genus.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Genus", 
+         subtitle=paste(paste0("F=",pm.bracken.genus$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.genus$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.genus_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.genus_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.7,0.6)
+
+p.family <- ggplot(pcoa.family.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Family",
+         subtitle=paste(paste0("F=",pm.bracken.family$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.family$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.family_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.family_variance_explained[2], "%)")) +
+  ylim(-0.6,0.9) +
+  xlim(-0.7,0.8)
+
+p.order <- ggplot(pcoa.order.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Order",
+         subtitle=paste(paste0("F=",pm.bracken.order$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.order$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.order_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.order_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.class <- ggplot(pcoa.class.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Class",
+         subtitle=paste(paste0("F=",pm.bracken.class$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.class$`Pr(>F)`[1]))) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.class_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.class_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.phylum <- ggplot(pcoa.phylum.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=Age_at_FecalSample), size=3) + 
+  theme_bw(base_size=40) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Phylum",
+         subtitle=paste(paste0("F=",pm.bracken.phylum$F[1] %>% signif(3),","),
+                        paste0("p=",pm.bracken.phylum$`Pr(>F)`[1]))) +
+ scale_color_continuous(name = "age", type="viridis", limits=c(50,110))  +
+  xlab(paste0("PCOA_1 (", pcoa.phylum_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.phylum_variance_explained[2], "%)")) +
+  ylim(-0.8,0.8) +
+  xlim(-0.5,0.8)
+
+
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+
+dir.create(paste0(outpath,"Figures/incommon_taxa"))
+png(paste0(outpath,"Figures/incommon_taxa/pcoa_bray_bracken_common.taxa_ilo_alllevels.png"), units="in", width=40, height=20, res=300)
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+dev.off()
+
+png(paste0(outpath,"Figures/incommon_taxa/pcoa_bray_bracken_common.taxa_ilo_main.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.phylum, p.genus, p.species, p.legend, ncol = 4, nrow = 1)
+dev.off()
+```
+
+# Visualize Mantel test results
+
+## For all taxonomic levels
+
+```{r, fig.dim=c(25,5)}
+
+# create tibble with all results
+mantel.res <- tibble(
+    taxonomic_level = factor(c('Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species'), levels=c('Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')),
+    correlation = c(mantel.phylum$statistic, 
+                    mantel.class$statistic, 
+                    mantel.order$statistic, 
+                    mantel.family$statistic, 
+                    mantel.genus$statistic, 
+                    mantel.species$statistic),
+    p_value = c(mantel.phylum$signif,
+                mantel.class$signif, 
+                mantel.order$signif,
+                mantel.family$signif, 
+                mantel.genus$signif, 
+                mantel.species$signif)
+)
+
+# Create the scatter plot
+p.mantel <- ggplot(mantel.res, aes(x = taxonomic_level, y = correlation)) +
+    geom_bar(stat = "identity", width=0.5) + 
+  ylim(0,1) +
+    labs(title = "Overall profile comparison: MetaPhlAn4 vs. Bracken",
+         y = "correlation coefficient",
+         x = "taxonomic level") +
+  geom_signif(y_position = c(0.95, 0.95, 0.95, 0.95, 0.95, 0.95), 
+              xmin = c(0.8, 1.8, 2.8, 3.8, 4.8, 5.8), 
+              xmax = c(1.2, 2.2, 3.2, 4.2, 5.2, 6.2),
+              annotation=paste0("p=",mantel.res$p_value), 
+              tip_length=0) +
+    theme_bw(base_size = 20) +
+  theme(axis.title.x=element_blank())
+
+p.mantel
+
+png(paste0(outpath,"Figures/incommon_taxa/mantel_test_common.taxa_ilo_alllevels.png"), units="in", width=20, height=5, res=300)
+p.mantel
+dev.off()
+```
+
+## For phylum, genus, species level 
+
+```{r, fig.dim=c(15,5)}
+
+# create tibble with all results
+mantel.res <- tibble(
+    taxonomic_level = factor(c('Phylum', 'Genus', 'Species'), levels=c('Phylum', 'Genus', 'Species')),
+    correlation = c(mantel.phylum$statistic, 
+                    mantel.genus$statistic, 
+                    mantel.species$statistic),
+    p_value = c(mantel.phylum$signif,
+                mantel.genus$signif, 
+                mantel.species$signif)
+)
+
+# Create the scatter plot
+p.mantel <- ggplot(mantel.res, aes(x = taxonomic_level, y = correlation)) +
+    geom_bar(stat = "identity", width=0.5) + 
+  ylim(0,1) +
+    labs(title = "Overall profile comparison: MetaPhlAn4 vs. Bracken",
+         y = "correlation coefficient",
+         x = "taxonomic level") +
+  geom_signif(y_position = c(0.95, 0.95, 0.955), 
+              xmin = c(0.8, 1.8, 2.8), 
+              xmax = c(1.2, 2.2, 3.2),
+              annotation=paste0("p=",mantel.res$p_value), 
+              tip_length=0) +
+    theme_bw(base_size = 20) +
+  theme(axis.title.x=element_blank())
+
+p.mantel
+
+png(paste0(outpath,"Figures/incommon_taxa/mantel_test_common.taxa_ilo_main.png"), units="in", width=10, height=5, res=300)
+p.mantel
+dev.off()
+```
+
+
+
+

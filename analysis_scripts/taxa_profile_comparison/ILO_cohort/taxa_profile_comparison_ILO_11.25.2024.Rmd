@@ -1,0 +1,1360 @@
+---
+title: "Compare taxonomic profiles and in-common taxa between Bracken and Metaphlan"
+author: "Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: paper
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, message=FALSE, warning=FALSE, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(dynamicTreeCut)
+#microbiome and single cell specific packages
+library(vegan)
+library(mia)
+library(scater)
+#write excel sheets
+library(writexl)
+library(RColorBrewer)
+library(kableExtra)
+
+#specify file path
+flpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/processed_data/data_library/"
+output_path <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/01_taxa_profile_comparison/ILO_cohort/output/"
+meta.dir <-"/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/decoder/"
+
+metaphlan_otufl <- "metaphlan4_renorm_ILO_phyloseq.09.30.2024.rds"
+phenofl <- "2024-11-18.cleaned.metag.list.csv"
+
+#read count thresholds
+read_thresh <- c("R0", "R0.5","R1")
+kmer_thresh <- c("K0", "K1","K3")
+```
+
+# Functions
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    select(c(tax.name, biom_samplenames)) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+# Read in metadata
+```{r}
+pheno.data <- read_csv(paste0(meta.dir,phenofl) ) %>%
+  dplyr::mutate(Sample=stool_kit)
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+
+```
+
+# Metaphlan4: Read in phenotype data and phyloseq object
+```{r metaphlan data}
+#load phyloseq obj
+metaphlan_ilo_biom <- readRDS(paste0(flpath, metaphlan_otufl))
+
+#add in phenotypic data
+metaphlan_ilo_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+metaphlan_ilo_biom <- subset_samples(metaphlan_ilo_biom, !is.na(Age_at_FecalSample))
+
+metaphlan.sample.meta <- sample_data(metaphlan_ilo_biom) %>% 
+  as_tibble(rownames="stool_kit")
+# metaphlan.samples <- metaphlan.sample.meta %>% dplyr::select(sample.ID, stool_kit)
+  
+OTU_metaphlan <- metaphlan_ilo_biom@otu_table@.Data
+# colnames(OTU_metaphlan) <- metaphlan.samples$stool_kit
+TAX_metaphlan <- metaphlan_ilo_biom@tax_table@.Data
+
+#save sample data for permanova
+# rownames(metaphlan_ilo_biom@sam_data) <- metaphlan_ilo_biom@sam_data$stool_kit
+# sample_names(metaphlan_ilo_biom) <- metaphlan_ilo_biom@sam_data$stool_kit
+metaphlan.samp.dat <- data.frame(metaphlan_ilo_biom@sam_data)
+
+```
+
+## Bracken - R0 threshold: Read in phyloseq object across all kmer minimizer thresholds
+```{r}
+#load bracken phyloseq objects based on read threshold R0 and across all kmer minimizer thresholds
+bracken_R0_biom <- lapply(1:length(kmer_thresh), function(x){
+  #load phyloseq obj
+  bracken_ilo_biom <- readRDS(paste0(flpath, "bracken_renorm_ILO_phyloseq.R0.",kmer_thresh[x],".10.09.2024.rds"))
+
+  #add in phenotypic data
+  bracken_ilo_biom@sam_data <- SAMPLE_phy
+
+  #keep samples with age group label
+  bracken_ilo_biom <- subset_samples(bracken_ilo_biom, !is.na(Age_at_FecalSample))
+
+  return(bracken_ilo_biom)
+})
+
+#renormalized relative abundances
+OTU_bracken_R0 <- lapply(1:length(kmer_thresh), function(x){
+  OTU_bracken <- bracken_R0_biom[[x]]@otu_table@.Data
+  return(OTU_bracken)
+})
+
+#taxa table
+TAX_bracken_R0 <- lapply(1:length(kmer_thresh), function(x){
+  TAX_bracken <- bracken_R0_biom[[x]]@tax_table@.Data
+  return(TAX_bracken)
+})
+
+#save sample data for permanova
+bracken_R0_meta <- lapply(1:length(kmer_thresh), function(x){
+ bracken.samp.dat <- data.frame(bracken_R0_biom[[x]]@sam_data)
+ return(bracken.samp.dat)
+})
+  
+```
+
+## Bracken - R0.5 threshold: Read in phyloseq object across all kmer minimizer thresholds
+```{r}
+#load bracken phyloseq objects based on read threshold R0.5 and across all kmer minimizer thresholds
+bracken_R0.5_biom <- lapply(1:length(kmer_thresh), function(x){
+  #load phyloseq obj
+  bracken_ilo_biom <- readRDS(paste0(flpath, "bracken_renorm_ILO_phyloseq.R0.5.",kmer_thresh[x],".10.09.2024.rds"))
+
+  #add in phenotypic data
+  bracken_ilo_biom@sam_data <- SAMPLE_phy
+
+  #keep samples with age group label
+  bracken_ilo_biom <- subset_samples(bracken_ilo_biom, !is.na(Age_at_FecalSample))
+
+  return(bracken_ilo_biom)
+})
+
+#renormalized relative abundances
+OTU_bracken_R0.5 <- lapply(1:length(kmer_thresh), function(x){
+  OTU_bracken <- bracken_R0.5_biom[[x]]@otu_table@.Data
+  return(OTU_bracken)
+})
+
+#taxa table
+TAX_bracken_R0.5 <- lapply(1:length(kmer_thresh), function(x){
+  TAX_bracken <- bracken_R0.5_biom[[x]]@tax_table@.Data
+  return(TAX_bracken)
+})
+
+#save sample data for permanova
+bracken_R0.5_meta <- lapply(1:length(kmer_thresh), function(x){
+ bracken.samp.dat <- data.frame(bracken_R0.5_biom[[x]]@sam_data)
+ return(bracken.samp.dat)
+})
+  
+```
+
+## Bracken - R1 threshold: Read in phyloseq object across all kmer minimizer thresholds
+```{r}
+#load bracken phyloseq objects based on read threshold R1 and across all kmer minimizer thresholds
+bracken_R1_biom <- lapply(1:length(kmer_thresh), function(x){
+  #load phyloseq obj
+  bracken_ilo_biom <- readRDS(paste0(flpath, "bracken_renorm_ILO_phyloseq.R1.",kmer_thresh[x],".10.09.2024.rds"))
+
+  #add in phenotypic data
+  bracken_ilo_biom@sam_data <- SAMPLE_phy
+
+  #keep samples with age group label
+  bracken_ilo_biom <- subset_samples(bracken_ilo_biom, !is.na(Age_at_FecalSample))
+
+  return(bracken_ilo_biom)
+})
+
+#renormalized relative abundances
+OTU_bracken_R1 <- lapply(1:length(kmer_thresh), function(x){
+  OTU_bracken <- bracken_R1_biom[[x]]@otu_table@.Data
+  return(OTU_bracken)
+})
+
+#taxa table
+TAX_bracken_R1 <- lapply(1:length(kmer_thresh), function(x){
+  TAX_bracken <- bracken_R1_biom[[x]]@tax_table@.Data
+  return(TAX_bracken)
+})
+
+#save sample data for permanova
+bracken_R1_meta <- lapply(1:length(kmer_thresh), function(x){
+ bracken.samp.dat <- data.frame(bracken_R1_biom[[x]]@sam_data)
+ return(bracken.samp.dat)
+})
+  
+```
+
+
+# Compare Metaphlan4 data and Bracken data with R0 threshold and across all kmer minimizer thresholds
+
+## Filter to common taxa and renormalize data
+
+```{r}
+#common taxa between metaphlan and bracken
+common_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R0_biom.taxa <- bracken_R0_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combine taxa tables keeping in-common taxa using inner_join
+  common_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R0_biom.taxa, by= c("tax.ID")) 
+  return(common_taxa_total)
+})
+
+#select the common taxonomic ID and taxa names for each data set to add back
+metaphlan_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID:Species) %>% column_to_rownames(var = "tax.ID")
+  return(metaphlan_taxa_total)
+})
+
+bracken_R0_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  bracken_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID, kingdom:species) %>% column_to_rownames(var = "tax.ID")
+  return(bracken_taxa_total)
+})
+
+#combine taxa tables based keeping common taxa using inner_join
+filtered_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R0_biom.taxa <- bracken_R0_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combined table
+  filtered_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R0_biom.taxa, by= c("tax.ID")) %>%
+    dplyr::select(tax.ID, kingdom:species) %>%
+                  column_to_rownames(var = "tax.ID")
+  return(filtered_taxa_total)
+})
+
+#subset otu table for common taxa
+metaphlan_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_biom.otu <- OTU_metaphlan[rownames(metaphlan_taxa_total[[x]]),] %>% as.matrix()
+})
+
+bracken_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_biom.otu <- OTU_bracken_R0[[x]][rownames(bracken_R0_taxa_total[[x]]),] %>% as.matrix()
+})
+
+#renormalize data
+metaphlan_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm <- t(t(metaphlan_ilo_biom.otu[[x]])/colSums(metaphlan_ilo_biom.otu[[x]]))
+})
+
+bracken_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm <- t(t(bracken_ilo_biom.otu[[x]])/colSums(bracken_ilo_biom.otu[[x]]))
+})
+
+#create tibble
+taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(common_taxa_total[[x]])
+})
+
+bracken_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(OTU_bracken_R0[[x]])
+})
+
+method_taxa_tib <- tibble(kmer_thresh = kmer_thresh, bracken_R0 = bracken_total, metaphlan = nrow(OTU_metaphlan), common_taxa = taxa_total)
+
+#visualize in table
+kable(method_taxa_tib, caption = paste0("total number of taxa"),"html") %>% kable_styling("striped") %>% scroll_box(width = "100%")
+```
+
+```{r}
+#save as tibbles
+metaphlan_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm.t <- metaphlan_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+bracken_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm.t <- bracken_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+#metphlan phyloseq obj
+# metaphlan.common.phy <- phyloseq::phyloseq(otu_table(metaphlan_ilo_renorm, taxa_are_rows = TRUE), tax_table(metaphlan_taxa_total %>% as.matrix),  sample_data(metaphlan.samp.dat))
+# metaphlan.common.phy
+# 
+# #bracken phyloseq obj
+# bracken.common.phy <- phyloseq::phyloseq(otu_table(bracken_ilo_renorm, taxa_are_rows = TRUE), tax_table(bracken_taxa_total %>% as.matrix),  sample_data(bracken.samp.dat))
+# bracken.common.phy
+```
+
+## Visualize relative abundances of taxa before renormalizing
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #calculate total relative abundances for in-common taxa and unique taxa based on subsetted otu table with in-common taxa from above
+  common.relabund.metaphlan <- colSums(metaphlan_ilo_biom.otu[[1]])
+  unique.relabund.metaphlan <- 1-common.relabund.metaphlan
+  common.relabund.bracken <- colSums(bracken_ilo_biom.otu[[1]])
+  unique.relabund.bracken <- 1-common.relabund.bracken
+  #boxplot(common.relabund.metaphlan, xlab="metaphlan", ylab="relative abundances of common taxa", main="relative abundance per sample")
+  #boxplot(common.relabund.bracken, xlab="bracken", ylab="relative abundances of common taxa", main="relative abundance per sample")
+
+  # create tibble for bracken with total relative abundances for in-common and unique taxa
+  common.relabund.bracken.t <- tibble::enframe(common.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R0-",kmer_thresh[x]), taxa="in-common")
+  unique.relabund.bracken.t <- tibble::enframe(unique.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R0-",kmer_thresh[x]), taxa="unique")
+  relabund.bracken.t <- dplyr::bind_rows(common.relabund.bracken.t, unique.relabund.bracken.t)
+
+  # create tibble for metaphlan with total relative abundances for in-common and unique taxa
+  common.relabund.metaphlan.t <- tibble::enframe(common.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="in-common")
+  unique.relabund.metaphlan.t <- tibble::enframe(unique.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="unique")
+  relabund.metaphlan.t <- dplyr::bind_rows(common.relabund.metaphlan.t, unique.relabund.metaphlan.t)
+
+  #combine this information into one tibble for both methods
+  relabund.method <- dplyr::bind_rows(relabund.metaphlan.t, relabund.bracken.t)
+
+  #ggplot of the relative abundance of in common taxa in each sample in both methods
+  p.rel.common <- ggplot(relabund.method, aes(x=sample.ID, y=relative_abundance, fill = taxa)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ method) +  # Separate plots by method
+  theme_minimal(base_size=20) +
+  labs(title = "ILO cohort",
+       x = "sample.ID",
+       y = "relative abundances",
+       fill = "species") +
+  theme(axis.text.x = element_blank())
+  #print(p.rel.common)
+  
+})
+
+
+
+
+# #save figure
+# png(paste0(outpath,"Figures/stacked_barplot_incommon.v.unique.species.png"), units="in", width=10, height=8, res=300)
+# p.rel.common
+# dev.off()
+
+```
+
+```{r, fig.dim=c(20,10)}
+
+#tibble and pivot longer
+metaphlan_ilo_otu.t <- OTU_metaphlan %>% as_tibble(rownames="tax.ID")
+metaphlan_ilo_otu.t_long <- pivot_longer(metaphlan_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+# Step 1: Determine the most abundant category for each sample
+most_abundant_per_sample <- metaphlan_ilo_otu.t_long %>%
+  group_by(stool_kit) %>%
+  filter(relabund == max(relabund)) %>%
+  ungroup()
+
+# Step 2: Count the frequency of each category being the most abundant
+category_frequency <- most_abundant_per_sample %>%
+  dplyr::count(tax.ID, sort = TRUE)
+
+# Step 3: Identify the category or categories that are the most abundant in the majority of samples (50% of samples)
+total_samples <- length(unique(metaphlan_ilo_otu.t_long))
+majority_threshold <- total_samples/2
+
+most_abundant_categories <- category_frequency %>%
+  filter(n > majority_threshold)
+
+# View the most abundant categories across most samples
+#print(most_abundant_categories)
+
+# Filter data for top taxa
+data_top_taxa <- metaphlan_ilo_otu.t_long %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+# check number of top  taxa that are part of the in-common taxa group
+lapply(1:length(kmer_thresh), function(x){
+sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID)
+})
+
+#filter metaphlan taxa table for top abundant taxa and combine taxa names
+combine.taxa.names <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+  unite(taxa_name,Kingdom:Species, sep="_")
+#write_csv(combine.taxa.names, file = paste0(outpath, "top_taxa_metaphlan.csv"))
+
+data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+# Plot stacked bar plot
+colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+p.metaphlan <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = "MetaPhlAn: Top Abundant Species Across Samples", x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+print(p.metaphlan)
+
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.metaphlan.png"), units="in", width=20, height=10, res=300)
+# p.metaphlan
+# dev.off()
+```
+
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #tibble and pivot longer
+  bracken_ilo_otu.t <- OTU_bracken_R0[[x]] %>% as_tibble(rownames="tax.ID")
+  bracken_ilo_otu.t_long <- pivot_longer(bracken_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+  # Step 1: Determine the most abundant category for each sample
+  most_abundant_per_sample <- bracken_ilo_otu.t_long %>%
+    group_by(stool_kit) %>%
+    filter(relabund == max(relabund)) %>%
+    ungroup()
+
+  # Step 2: Count the frequency of each category being the most abundant
+  category_frequency <- most_abundant_per_sample %>%
+    dplyr::count(tax.ID, sort = TRUE)
+
+  # Step 3: Identify the category or categories that are the most abundant in the majority of samples
+  total_samples <- length(unique(bracken_ilo_otu.t_long))
+  majority_threshold <- total_samples/2
+
+  most_abundant_categories <- category_frequency %>%
+    filter(n > majority_threshold)
+
+  # View the most abundant categories across most samples
+  #print(most_abundant_categories)
+
+  # Filter data for top taxa
+  data_top_taxa <- bracken_ilo_otu.t_long %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+  # check number of top  taxa that are part of the in-common taxa group
+  print(sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID))
+
+  #filter bracken taxa table for top abundant taxa and combine taxa names
+  combine.taxa.names <- bracken_R0_biom[[x]]@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+    unite(taxa_name,kingdom:species, sep="_")
+
+  data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+  # Plot stacked bar plot
+  colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+  p.bracken <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Bracken R0", kmer_thresh[x],": Top Abundant Species Across Samples"), x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+  #print(p.bracken)
+  
+})
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.bracken.png"), units="in", width=25, height=10, res=300)
+# p.bracken
+# dev.off()
+```
+# Compare Metaphlan4 data and Bracken data with R0.5 threshold and across all kmer minimizer thresholds
+
+## Filter to common taxa and renormalize data
+
+```{r}
+#common taxa between metaphlan and bracken
+common_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R0.5_biom.taxa <- bracken_R0.5_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combine taxa tables keeping in-common taxa using inner_join
+  common_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R0.5_biom.taxa, by= c("tax.ID")) 
+  return(common_taxa_total)
+})
+
+#select the common taxonomic ID and taxa names for each data set to add back
+metaphlan_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID:Species) %>% column_to_rownames(var = "tax.ID")
+  return(metaphlan_taxa_total)
+})
+
+bracken_R0.5_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  bracken_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID, kingdom:species) %>% column_to_rownames(var = "tax.ID")
+  return(bracken_taxa_total)
+})
+
+#combine taxa tables based keeping common taxa using inner_join
+filtered_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R0.5_biom.taxa <- bracken_R0.5_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combined table
+  filtered_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R0.5_biom.taxa, by= c("tax.ID")) %>%
+    dplyr::select(tax.ID, kingdom:species) %>%
+                  column_to_rownames(var = "tax.ID")
+  return(filtered_taxa_total)
+})
+
+#subset otu table for common taxa
+metaphlan_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_biom.otu <- OTU_metaphlan[rownames(metaphlan_taxa_total[[x]]),] %>% as.matrix()
+})
+
+bracken_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_biom.otu <- OTU_bracken_R0.5[[x]][rownames(bracken_R0.5_taxa_total[[x]]),] %>% as.matrix()
+})
+
+#renormalize data
+metaphlan_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm <- t(t(metaphlan_ilo_biom.otu[[x]])/colSums(metaphlan_ilo_biom.otu[[x]]))
+})
+
+bracken_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm <- t(t(bracken_ilo_biom.otu[[x]])/colSums(bracken_ilo_biom.otu[[x]]))
+})
+
+#create tibble
+taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(common_taxa_total[[x]])
+})
+
+bracken_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(OTU_bracken_R0.5[[x]])
+})
+
+method_taxa_tib <- tibble(kmer_thresh = kmer_thresh, bracken_R0.5 = bracken_total, metaphlan = nrow(OTU_metaphlan), common_taxa = taxa_total)
+
+#visualize in table
+kable(method_taxa_tib, caption = paste0("total number of taxa"),"html") %>% kable_styling("striped") %>% scroll_box(width = "100%")
+```
+
+```{r}
+#save as tibbles
+metaphlan_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm.t <- metaphlan_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+bracken_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm.t <- bracken_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+
+```
+
+## Visualize relative abundances of taxa before renormalizing
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #calculate total relative abundances for in-common taxa and unique taxa based on subsetted otu table with in-common taxa from above
+  common.relabund.metaphlan <- colSums(metaphlan_ilo_biom.otu[[2]])
+  unique.relabund.metaphlan <- 1-common.relabund.metaphlan
+  common.relabund.bracken <- colSums(bracken_ilo_biom.otu[[2]])
+  unique.relabund.bracken <- 1-common.relabund.bracken
+  #boxplot(common.relabund.metaphlan, xlab="metaphlan", ylab="relative abundances of common taxa", main="relative abundance per sample")
+  #boxplot(common.relabund.bracken, xlab="bracken", ylab="relative abundances of common taxa", main="relative abundance per sample")
+
+  # create tibble for bracken with total relative abundances for in-common and unique taxa
+  common.relabund.bracken.t <- tibble::enframe(common.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R0.5-",kmer_thresh[x]), taxa="in-common")
+  unique.relabund.bracken.t <- tibble::enframe(unique.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R0.5-",kmer_thresh[x]), taxa="unique")
+  relabund.bracken.t <- dplyr::bind_rows(common.relabund.bracken.t, unique.relabund.bracken.t)
+
+  # create tibble for metaphlan with total relative abundances for in-common and unique taxa
+  common.relabund.metaphlan.t <- tibble::enframe(common.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="in-common")
+  unique.relabund.metaphlan.t <- tibble::enframe(unique.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="unique")
+  relabund.metaphlan.t <- dplyr::bind_rows(common.relabund.metaphlan.t, unique.relabund.metaphlan.t)
+
+  #combine this information into one tibble for both methods
+  relabund.method <- dplyr::bind_rows(relabund.metaphlan.t, relabund.bracken.t)
+
+  #ggplot of the relative abundance of in common taxa in each sample in both methods
+  p.rel.common <- ggplot(relabund.method, aes(x=sample.ID, y=relative_abundance, fill = taxa)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ method) +  # Separate plots by method
+  theme_minimal(base_size=20) +
+  labs(title = "ILO cohort",
+       x = "sample.ID",
+       y = "relative abundances",
+       fill = "species") +
+  theme(axis.text.x = element_blank())
+  #print(p.rel.common)
+  
+})
+
+
+
+
+# #save figure
+# png(paste0(outpath,"Figures/stacked_barplot_incommon.v.unique.species.png"), units="in", width=10, height=8, res=300)
+# p.rel.common
+# dev.off()
+
+```
+
+```{r, fig.dim=c(20,10)}
+
+#tibble and pivot longer
+metaphlan_ilo_otu.t <- OTU_metaphlan %>% as_tibble(rownames="tax.ID")
+metaphlan_ilo_otu.t_long <- pivot_longer(metaphlan_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+# Step 1: Determine the most abundant category for each sample
+most_abundant_per_sample <- metaphlan_ilo_otu.t_long %>%
+  group_by(stool_kit) %>%
+  filter(relabund == max(relabund)) %>%
+  ungroup()
+
+# Step 2: Count the frequency of each category being the most abundant
+category_frequency <- most_abundant_per_sample %>%
+  dplyr::count(tax.ID, sort = TRUE)
+
+# Step 3: Identify the category or categories that are the most abundant in the majority of samples (50% of samples)
+total_samples <- length(unique(metaphlan_ilo_otu.t_long))
+majority_threshold <- total_samples/2
+
+most_abundant_categories <- category_frequency %>%
+  filter(n > majority_threshold)
+
+# View the most abundant categories across most samples
+#print(most_abundant_categories)
+
+# Filter data for top taxa
+data_top_taxa <- metaphlan_ilo_otu.t_long %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+# check number of top  taxa that are part of the in-common taxa group
+lapply(1:length(kmer_thresh), function(x){
+sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID)
+})
+
+#filter metaphlan taxa table for top abundant taxa and combine taxa names
+combine.taxa.names <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+  unite(taxa_name,Kingdom:Species, sep="_")
+#write_csv(combine.taxa.names, file = paste0(outpath, "top_taxa_metaphlan.csv"))
+
+data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+# Plot stacked bar plot
+colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+p.metaphlan <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = "MetaPhlAn: Top Abundant Species Across Samples", x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+print(p.metaphlan)
+
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.metaphlan.png"), units="in", width=20, height=10, res=300)
+# p.metaphlan
+# dev.off()
+```
+
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #tibble and pivot longer
+  bracken_ilo_otu.t <- OTU_bracken_R0.5[[x]] %>% as_tibble(rownames="tax.ID")
+  bracken_ilo_otu.t_long <- pivot_longer(bracken_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+  # Step 1: Determine the most abundant category for each sample
+  most_abundant_per_sample <- bracken_ilo_otu.t_long %>%
+    group_by(stool_kit) %>%
+    filter(relabund == max(relabund)) %>%
+    ungroup()
+
+  # Step 2: Count the frequency of each category being the most abundant
+  category_frequency <- most_abundant_per_sample %>%
+    dplyr::count(tax.ID, sort = TRUE)
+
+  # Step 3: Identify the category or categories that are the most abundant in the majority of samples
+  total_samples <- length(unique(bracken_ilo_otu.t_long))
+  majority_threshold <- total_samples/2
+
+  most_abundant_categories <- category_frequency %>%
+    filter(n > majority_threshold)
+
+  # View the most abundant categories across most samples
+  #print(most_abundant_categories)
+
+  # Filter data for top taxa
+  data_top_taxa <- bracken_ilo_otu.t_long %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+  # check number of top  taxa that are part of the in-common taxa group
+  print(sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID))
+
+  #filter bracken taxa table for top abundant taxa and combine taxa names
+  combine.taxa.names <- bracken_R0.5_biom[[x]]@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+    unite(taxa_name,kingdom:species, sep="_")
+
+  data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+  # Plot stacked bar plot
+  colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+  p.bracken <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Bracken R0.5", kmer_thresh[x],": Top Abundant Species Across Samples"), x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+  #print(p.bracken)
+  
+})
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.bracken.png"), units="in", width=25, height=10, res=300)
+# p.bracken
+# dev.off()
+```
+
+# Compare Metaphlan4 data and Bracken data with R1 threshold and across all kmer minimizer thresholds
+
+## Filter to common taxa and renormalize data
+
+```{r}
+#common taxa between metaphlan and bracken
+common_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R1_biom.taxa <- bracken_R1_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combine taxa tables keeping in-common taxa using inner_join
+  common_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R1_biom.taxa, by= c("tax.ID")) 
+  return(common_taxa_total)
+})
+
+#save unique taxa for bracken data with R1 and K3 thresholds
+bracken_R1_biom.taxa <- bracken_R1_biom[[3]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+bracken.unique.taxa <- bracken_R1_biom.taxa %>% dplyr::filter(!tax.ID %in% common_taxa_total[[3]]$tax.ID) %>% select(tax.ID)
+
+write_csv(bracken.unique.taxa, file=paste0(output_path,"bracken.R1.K3_unique_taxa.csv"))
+
+#save unique taxa for metaphlan compared to bracken data with R1 and K3 thresholds
+metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+metaphlan.unique.taxa <- metaphlan_ilo_biom.taxa %>% dplyr::filter(!tax.ID %in% common_taxa_total[[3]]$tax.ID) %>% select(tax.ID)
+write_csv(bracken.unique.taxa, file=paste0(output_path,"metaphlan_unique_taxa.csv"))
+
+
+#select the common taxonomic ID and taxa names for each data set to add back
+metaphlan_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID:Species) %>% column_to_rownames(var = "tax.ID")
+  return(metaphlan_taxa_total)
+})
+
+bracken_R1_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  bracken_taxa_total <- common_taxa_total[[x]] %>% dplyr::select(tax.ID, kingdom:species) %>% column_to_rownames(var = "tax.ID")
+  return(bracken_taxa_total)
+})
+
+#combine taxa tables based keeping common taxa using inner_join
+filtered_taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  #adjust taxa table
+  #move rownames to column variable tax.ID
+  metaphlan_ilo_biom.taxa <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+  bracken_R1_biom.taxa <- bracken_R1_biom[[x]]@tax_table@.Data %>% as_tibble(rownames = "tax.ID")
+
+  #combined table
+  filtered_taxa_total <- dplyr::inner_join(metaphlan_ilo_biom.taxa, bracken_R1_biom.taxa, by= c("tax.ID")) %>%
+    dplyr::select(tax.ID, kingdom:species) %>%
+                  column_to_rownames(var = "tax.ID")
+  return(filtered_taxa_total)
+})
+
+#subset otu table for common taxa
+metaphlan_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_biom.otu <- OTU_metaphlan[rownames(metaphlan_taxa_total[[x]]),] %>% as.matrix()
+})
+
+bracken_ilo_biom.otu <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_biom.otu <- OTU_bracken_R1[[x]][rownames(bracken_R1_taxa_total[[x]]),] %>% as.matrix()
+})
+
+#renormalize data
+metaphlan_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm <- t(t(metaphlan_ilo_biom.otu[[x]])/colSums(metaphlan_ilo_biom.otu[[x]]))
+})
+
+bracken_ilo_renorm <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm <- t(t(bracken_ilo_biom.otu[[x]])/colSums(bracken_ilo_biom.otu[[x]]))
+})
+
+#create tibble
+taxa_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(common_taxa_total[[x]])
+})
+
+bracken_total <- lapply(1:length(kmer_thresh), function(x){
+  nrow(OTU_bracken_R1[[x]])
+})
+
+method_taxa_tib <- tibble(kmer_thresh = kmer_thresh, bracken_R1 = bracken_total, metaphlan = nrow(OTU_metaphlan), common_taxa = taxa_total)
+
+#visualize in table
+kable(method_taxa_tib, caption = paste0("total number of taxa"),"html") %>% kable_styling("striped") %>% scroll_box(width = "100%")
+```
+
+```{r}
+#save as tibbles
+metaphlan_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  metaphlan_ilo_renorm.t <- metaphlan_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+bracken_ilo_renorm.t <- lapply(1:length(kmer_thresh), function(x){
+  bracken_ilo_renorm.t <- bracken_ilo_renorm[[x]] %>% as_tibble(rownames="tax.ID")
+})
+
+```
+
+## Visualize relative abundances of taxa before renormalizing
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #calculate total relative abundances for in-common taxa and unique taxa based on subsetted otu table with in-common taxa from above
+  common.relabund.metaphlan <- colSums(metaphlan_ilo_biom.otu[[x]])
+  unique.relabund.metaphlan <- 1-common.relabund.metaphlan
+  common.relabund.bracken <- colSums(bracken_ilo_biom.otu[[x]])
+  unique.relabund.bracken <- 1-common.relabund.bracken
+  #boxplot(common.relabund.metaphlan, xlab="metaphlan", ylab="relative abundances of common taxa", main="relative abundance per sample")
+  #boxplot(common.relabund.bracken, xlab="bracken", ylab="relative abundances of common taxa", main="relative abundance per sample")
+
+  # create tibble for bracken with total relative abundances for in-common and unique taxa
+  common.relabund.bracken.t <- tibble::enframe(common.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R1-",kmer_thresh[x]), taxa="in-common")
+  unique.relabund.bracken.t <- tibble::enframe(unique.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken-R1-",kmer_thresh[x]), taxa="unique")
+  relabund.bracken.t <- dplyr::bind_rows(common.relabund.bracken.t, unique.relabund.bracken.t)
+
+  # create tibble for metaphlan with total relative abundances for in-common and unique taxa
+  common.relabund.metaphlan.t <- tibble::enframe(common.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="in-common")
+  unique.relabund.metaphlan.t <- tibble::enframe(unique.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="unique")
+  relabund.metaphlan.t <- dplyr::bind_rows(common.relabund.metaphlan.t, unique.relabund.metaphlan.t)
+
+  #combine this information into one tibble for both methods
+  relabund.method <- dplyr::bind_rows(relabund.metaphlan.t, relabund.bracken.t)
+
+  #ggplot of the relative abundance of in common taxa in each sample in both methods
+  p.rel.common <- ggplot(relabund.method, aes(x=sample.ID, y=relative_abundance, fill = taxa)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ method) +  # Separate plots by method
+  theme_minimal(base_size=20) +
+  labs(title = "ILO cohort",
+       x = "sample.ID",
+       y = "relative abundances",
+       fill = "species") +
+  theme(axis.text.x = element_blank())
+  #print(p.rel.common)
+  
+})
+
+
+
+
+# #save figure
+# png(paste0(outpath,"Figures/stacked_barplot_incommon.v.unique.species.png"), units="in", width=10, height=8, res=300)
+# p.rel.common
+# dev.off()
+
+```
+
+```{r, fig.dim=c(20,10)}
+
+#tibble and pivot longer
+metaphlan_ilo_otu.t <- OTU_metaphlan %>% as_tibble(rownames="tax.ID")
+metaphlan_ilo_otu.t_long <- pivot_longer(metaphlan_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+# Step 1: Determine the most abundant category for each sample
+most_abundant_per_sample <- metaphlan_ilo_otu.t_long %>%
+  group_by(stool_kit) %>%
+  filter(relabund == max(relabund)) %>%
+  ungroup()
+
+# Step 2: Count the frequency of each category being the most abundant
+category_frequency <- most_abundant_per_sample %>%
+  dplyr::count(tax.ID, sort = TRUE)
+
+# Step 3: Identify the category or categories that are the most abundant in the majority of samples (50% of samples)
+total_samples <- length(unique(metaphlan_ilo_otu.t_long))
+majority_threshold <- total_samples/2
+
+most_abundant_categories <- category_frequency %>%
+  filter(n > majority_threshold)
+
+# View the most abundant categories across most samples
+#print(most_abundant_categories)
+
+# Filter data for top taxa
+data_top_taxa <- metaphlan_ilo_otu.t_long %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+# check number of top  taxa that are part of the in-common taxa group
+lapply(1:length(kmer_thresh), function(x){
+sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID)
+})
+
+#filter metaphlan taxa table for top abundant taxa and combine taxa names
+combine.taxa.names <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+  dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+  unite(taxa_name,Kingdom:Species, sep="_")
+#write_csv(combine.taxa.names, file = paste0(outpath, "top_taxa_metaphlan.csv"))
+
+data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+# Plot stacked bar plot
+colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+p.metaphlan <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = "MetaPhlAn: Top Abundant Species Across Samples", x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+print(p.metaphlan)
+
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.metaphlan.png"), units="in", width=20, height=10, res=300)
+# p.metaphlan
+# dev.off()
+```
+
+
+```{r, fig.dim=c(20,10)}
+lapply(1:length(kmer_thresh), function(x){
+  #tibble and pivot longer
+  bracken_ilo_otu.t <- OTU_bracken_R1[[x]] %>% as_tibble(rownames="tax.ID")
+  bracken_ilo_otu.t_long <- pivot_longer(bracken_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+  # Step 1: Determine the most abundant category for each sample
+  most_abundant_per_sample <- bracken_ilo_otu.t_long %>%
+    group_by(stool_kit) %>%
+    filter(relabund == max(relabund)) %>%
+    ungroup()
+
+  # Step 2: Count the frequency of each category being the most abundant
+  category_frequency <- most_abundant_per_sample %>%
+    dplyr::count(tax.ID, sort = TRUE)
+
+  # Step 3: Identify the category or categories that are the most abundant in the majority of samples
+  total_samples <- length(unique(bracken_ilo_otu.t_long))
+  majority_threshold <- total_samples/2
+
+  most_abundant_categories <- category_frequency %>%
+    filter(n > majority_threshold)
+
+  # View the most abundant categories across most samples
+  #print(most_abundant_categories)
+
+  # Filter data for top taxa
+  data_top_taxa <- bracken_ilo_otu.t_long %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID)
+
+  # check number of top  taxa that are part of the in-common taxa group
+  print(sum(rownames(filtered_taxa_total[[x]]) %in% most_abundant_categories$tax.ID))
+
+  #filter bracken taxa table for top abundant taxa and combine taxa names
+  combine.taxa.names <- bracken_R1_biom[[x]]@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+    unite(taxa_name,kingdom:species, sep="_")
+
+  data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID")
+
+  # Plot stacked bar plot
+  colors <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+
+  p.bracken <- ggplot(data_top_taxa, aes(x = stool_kit, y = relabund, fill = taxa_name)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Bracken R1", kmer_thresh[x],": Top Abundant Species Across Samples"), x = "Sample", y = "Relative Abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+  #print(p.bracken)
+  
+})
+
+#save figure
+# png(paste0(outpath,"Figures/top.abundant.species.bracken.png"), units="in", width=25, height=10, res=300)
+# p.bracken
+# dev.off()
+```
+
+# Selected thresholds
+
+## in-common vs unique taxa
+
+```{r}
+#calculate total relative abundances for in-common taxa and unique taxa based on subsetted otu table with in-common taxa from above
+  common.relabund.metaphlan <- colSums(metaphlan_ilo_biom.otu[[3]])
+  unique.relabund.metaphlan <- 1-common.relabund.metaphlan
+  common.relabund.bracken <- colSums(bracken_ilo_biom.otu[[3]])
+  unique.relabund.bracken <- 1-common.relabund.bracken
+  #boxplot(common.relabund.metaphlan, xlab="metaphlan", ylab="relative abundances of common taxa", main="relative abundance per sample")
+  #boxplot(common.relabund.bracken, xlab="bracken", ylab="relative abundances of common taxa", main="relative abundance per sample")
+
+  #average proportion of in-common taxa based on taxonomic classifier
+  summary(common.relabund.bracken)
+  summary(common.relabund.metaphlan)
+
+  # create tibble for bracken with total relative abundances for in-common and unique taxa
+  common.relabund.bracken.t <- tibble::enframe(common.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken"), taxa="in-common")
+  unique.relabund.bracken.t <- tibble::enframe(unique.relabund.bracken, name="sample.ID", value="relative_abundance") %>%
+    mutate(method=paste0("Bracken"), taxa="unique")
+  relabund.bracken.t <- dplyr::bind_rows(common.relabund.bracken.t, unique.relabund.bracken.t)
+
+  # create tibble for metaphlan with total relative abundances for in-common and unique taxa
+  common.relabund.metaphlan.t <- tibble::enframe(common.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="in-common")
+  unique.relabund.metaphlan.t <- tibble::enframe(unique.relabund.metaphlan, name="sample.ID", value="relative_abundance") %>%
+    mutate(method="MetaPhlAn4", taxa="unique")
+  relabund.metaphlan.t <- dplyr::bind_rows(common.relabund.metaphlan.t, unique.relabund.metaphlan.t)
+
+  #combine this information into one tibble for both methods
+  relabund.method <- dplyr::bind_rows(relabund.metaphlan.t, relabund.bracken.t)
+
+  #ggplot of the relative abundance of in common taxa in each sample in both methods
+  p.rel.common <- ggplot(relabund.method, aes(x=sample.ID, y=relative_abundance, fill = taxa)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ method) +  # Separate plots by method
+  theme_minimal(base_size=20) +
+  labs(title = "ILO cohort",
+       x = "sample",
+       y = "relative abundance",
+       fill = "species") +
+  theme(axis.text.x = element_blank())
+  p.rel.common
+  
+#save figure
+png(paste0(paste0(output_path,"Figures/stacked_barplot_species_ilo.png")), units="in", width=10, height=5, res=300)
+p.rel.common
+dev.off()
+```
+
+
+## Bracken: R1 K3 thresholds
+
+```{r, fig.dim=c(10,5)}
+#tibble and pivot longer
+  bracken_ilo_otu.t <- OTU_bracken_R1[[3]] %>% as_tibble(rownames="tax.ID")
+  bracken_ilo_otu.t_long <- pivot_longer(bracken_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+  # Step 1: Determine the most abundant category for each sample
+  most_abundant_per_sample <- bracken_ilo_otu.t_long %>%
+    group_by(stool_kit) %>%
+    filter(relabund == max(relabund)) %>%
+    ungroup()
+
+  # Step 2: Count the frequency of each category being the most abundant
+  category_frequency <- most_abundant_per_sample %>%
+    dplyr::count(tax.ID, sort = TRUE)
+
+  # Step 3: Identify the category or categories that are the most abundant in the majority of samples
+  total_samples <- length(unique(bracken_ilo_otu.t_long))
+  majority_threshold <- total_samples/2
+
+  most_abundant_categories <- category_frequency %>%
+    filter(n > majority_threshold)
+  
+  top_10_abundant <- most_abundant_categories[1:10,]
+
+  # View the most abundant categories across most samples
+  #print(most_abundant_categories)
+
+  # Filter data for top taxa
+  data_top_taxa <- bracken_ilo_otu.t_long %>%
+    dplyr::filter(tax.ID %in% top_10_abundant$tax.ID)
+
+
+  #filter bracken taxa table for top abundant taxa and combine taxa names
+  combine.taxa.names <- bracken_R1_biom[[3]]@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+    unite(taxa_name,kingdom:species, sep="_")
+
+  data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID", "taxa_name") 
+
+taxa.names <- sapply(1:nrow(data_top_taxa), function(x){
+    stripped.name <- strsplit(data_top_taxa$taxa_name[x], "[_]")[[1]]
+    taxa.name <- stripped.name[16:length(stripped.name)] %>% paste0(collapse="_")
+    return(taxa.name)
+})
+
+data_top_taxa$taxa_label <- taxa.names 
+
+other_relabund <- data_top_taxa %>% group_by(stool_kit) %>% 
+    summarize(relabund=1-sum(relabund)) %>% 
+    mutate(taxa_name="Other", taxa_label="Other", tax.ID="Other")
+
+  top_10_data <- dplyr::full_join(data_top_taxa, other_relabund, by=c("tax.ID","taxa_name", "stool_kit", "relabund", "taxa_label"))
+
+  # Plot stacked bar plot
+  colors <- c(colorRampPalette(brewer.pal(12, "Paired"))(10), "grey")
+
+  p.bracken <- ggplot(top_10_data, aes(x = stool_kit, y = relabund, fill = taxa_label)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Bracken"), x = "sample", y = "relative abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+  print(p.bracken)
+  
+```
+
+## Metaphlan4
+
+```{r, fig.dim=c(10,5)}
+
+#tibble and pivot longer
+metaphlan_ilo_otu.t <- OTU_metaphlan %>% as_tibble(rownames="tax.ID")
+metaphlan_ilo_otu.t_long <- pivot_longer(metaphlan_ilo_otu.t, cols = -tax.ID, names_to = "stool_kit", values_to = "relabund")
+
+# Step 1: Determine the most abundant category for each sample
+most_abundant_per_sample <- metaphlan_ilo_otu.t_long %>%
+  group_by(stool_kit) %>%
+  filter(relabund == max(relabund)) %>%
+  ungroup()
+
+# Step 2: Count the frequency of each category being the most abundant
+category_frequency <- most_abundant_per_sample %>%
+  dplyr::count(tax.ID, sort = TRUE)
+
+# Step 3: Identify the category or categories that are the most abundant in the majority of samples
+  total_samples <- length(unique(metaphlan_ilo_otu.t_long))
+  majority_threshold <- total_samples/2
+
+  most_abundant_categories <- category_frequency %>%
+    filter(n > majority_threshold)
+  
+  top_10_abundant <- most_abundant_categories[1:10,]
+
+  # View the most abundant categories across most samples
+  #print(most_abundant_categories)
+
+  # Filter data for top taxa
+  data_top_taxa <- metaphlan_ilo_otu.t_long %>%
+    dplyr::filter(tax.ID %in% top_10_abundant$tax.ID)
+
+
+  #filter metaphlan taxa table for top abundant taxa and combine taxa names
+  combine.taxa.names <- metaphlan_ilo_biom@tax_table@.Data %>% as_tibble(rownames="tax.ID") %>%
+    dplyr::filter(tax.ID %in% most_abundant_categories$tax.ID) %>% 
+    unite(taxa_name,Kingdom:Species, sep="_")
+
+  data_top_taxa <- dplyr::inner_join(data_top_taxa, combine.taxa.names, by="tax.ID", "taxa_name") 
+
+taxa.names <- sapply(1:nrow(data_top_taxa), function(x){
+    stripped.name <- strsplit(data_top_taxa$taxa_name[x], "[_]")[[1]]
+    taxa.name <- stripped.name[16:length(stripped.name)] %>% paste0(collapse="_")
+    return(taxa.name)
+})
+
+data_top_taxa$taxa_label <- taxa.names 
+
+other_relabund <- data_top_taxa %>% group_by(stool_kit) %>% 
+    summarize(relabund=1-sum(relabund)) %>% 
+    mutate(taxa_name="Other", taxa_label="Other", tax.ID="Other")
+
+  top_10_data <- dplyr::full_join(data_top_taxa, other_relabund, by=c("tax.ID","taxa_name", "stool_kit", "relabund", "taxa_label"))
+
+  # Plot stacked bar plot
+  colors <- c(colorRampPalette(brewer.pal(12, "Paired"))(10), "grey")
+
+  p.metaphlan <- ggplot(top_10_data, aes(x = stool_kit, y = relabund, fill = taxa_label)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("MetaPhlAn4"), x = "sample", y = "relative abundance") +
+    theme_minimal(base_size=15) +
+    theme(axis.text.x = element_blank(),
+        legend.position = "right") +
+    scale_fill_manual(values=colors)  # Adjust color palette as needed
+  print(p.metaphlan)
+  
+```
+
+## Combined plot
+
+```{r, fig.dim=c(20,5)}
+#save figure
+png(paste0(paste0(output_path,"Figures/top10_abundant_species_ilo.png")), units="in", width=20, height=5, res=300)
+ggpubr::ggarrange(p.bracken, p.metaphlan)
+dev.off()
+```
+
+
+
+

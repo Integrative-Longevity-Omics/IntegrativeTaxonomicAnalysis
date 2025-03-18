@@ -1,0 +1,885 @@
+---
+title: "Beta diversity analysis of metaphlan4 Xu et al chinese cohort filtered/processed data"
+author: "Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: united
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(dynamicTreeCut)
+#microbiome and single cell specific packages
+library(vegan)
+library(mia)
+library(scater)
+#write excel sheets
+library(writexl)
+
+#specify file path
+flpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/external_cohorts/Han_Chinese_Centenarian/processed_data/data_library/"
+outpath <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/02_beta_diversity_analysis/Chinese_cohort/output/"
+meta.dir <- "/restricted/projectnb/necs/Data_library/Metabolomics/resources/Xu_plasma_metabolite_analysis/"
+sra.dir <- "/restricted/projectnb/uh2-sebas/data/metagenomics/external_cohorts/Han_Chinese_Centenarian/metadata/"
+
+otufl <- "metaphlan4_renorm_chinese_phyloseq.10.23.2024.rds"
+phenofl <- "phenotype.xlsx"
+
+#set seed
+set.seed(157)
+
+```
+
+This script is for diversity analysis using data after QC.
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/ye_analyses/Scripts/UserDefinedFunctions/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    select(c(tax.name, biom_samplenames)) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_chinese_kraken.taxa, 
+                     otudata=biom_chinese_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+# Read in phenotypic data
+
+
+```{r, message=FALSE}
+# Extract phenotypic data
+#load clinical metadata information
+#clinical.data <- read_excel(paste0(meta.dir, "DifferentialAbundance_Supplement.xlsx"), sheet = "Table S1 Metadata", skip = 1)
+clinical.data <- read_excel(paste0(meta.dir, phenofl))
+
+#add ethnicity variable
+clinical.data$ethnicity <- "han_chinese"
+
+
+#extract sample IDs and create family ID and group ID
+sample.ID <- clinical.data %>% dplyr::select(1) %>% pull()
+
+fam.group <- str_remove(sample.ID, "QCS-") %>%                       
+              str_split("-") %>%
+                unlist() 
+
+fam.group <- matrix(fam.group, nrow=2)
+
+#create family ID
+fam.id <- fam.group[1,]
+
+#create group ID
+group.id <- fam.group[2,]
+group.id[group.id == "1"] <- "Advanced Age"
+group.id[group.id == "2" | group.id == "3"] <- "Offspring"
+
+
+#add to clinical data
+clinical.clean <- clinical.data %>%
+  mutate(sample.ID = sample.ID, fam.id = fam.id, group = group.id) 
+clinical.clean$"C-age (years)" <- as.integer(clinical.clean$"C-age (years)")
+
+
+#load sample Run names and sample SRA names
+SRA.data <- read_csv(paste0(sra.dir,"SraRunInfo.csv"))
+
+SRA.clean <- SRA.data %>% 
+  dplyr::select(Run, SampleName) 
+
+#sample ID and sample SRA names
+sample.dict <- read_excel(paste0(sra.dir, "sample name-sequencing ID sheet.xlsx"))
+
+#combine files
+sample.info <- dplyr::inner_join(SRA.clean, sample.dict, by = c("SampleName"))
+
+pheno.data <- dplyr::inner_join(sample.info, clinical.clean, by = c("sample.ID")) %>% 
+                                  dplyr::select(-c(sample.ID)) %>%
+                                  mutate(stool_kit = Run, Sample=Run) %>%
+                                  dplyr::rename(c_age_years="C-age (years)")
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+```
+
+# phyloseq object
+```{r read in data}
+#load phyloseq obj
+filtered_chinese_biom <- readRDS(paste0(flpath, otufl))
+
+#add phenotypic data to phyloseq object
+filtered_chinese_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age label
+subset_chinese_biom <- subset_samples(filtered_chinese_biom, !is.na(c_age_years))
+
+OTU_filtered <- subset_chinese_biom@otu_table@.Data
+TAX_filtered <- subset_chinese_biom@tax_table@.Data
+
+sample.meta <- sample_data(subset_chinese_biom) %>% 
+  as_tibble(rownames="sample.ID")
+
+#save sample data for permanova
+samp.dat <- as.matrix(subset_chinese_biom@sam_data)
+```
+
+
+# Beta diversity across taxonomic hierarchy
+
+## Create Tree Summarized Experiment object from Phyloseq object 
+
+```{r}
+#convert phyloseq object to a tree summarized experiment object
+metaphlan_tse <- mia::makeTreeSummarizedExperimentFromPhyloseq(subset_chinese_biom)
+metaphlan_tse
+
+
+#agglomerate based on each taxonomic rank and save as alternative assays in the object
+altExps(metaphlan_tse) <- mia::splitByRanks(metaphlan_tse)
+metaphlan_tse
+
+
+```
+
+```{r}
+#taxa diversity for species
+species_tse <- altExp(metaphlan_tse,"Species")
+beta.div.species <- rbiom::beta.div(assay(species_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.species <- apply(as.matrix(beta.div.species), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.species <- uniqueness.species %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+#taxa diversity for genus
+genus_tse <- altExp(metaphlan_tse,"Genus")
+beta.div.genus <- rbiom::beta.div(assay(genus_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.genus <- apply(as.matrix(beta.div.genus), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.genus <- uniqueness.genus %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+#taxa diversity for family
+family_tse <- altExp(metaphlan_tse,"Family")
+beta.div.family <- rbiom::beta.div(assay(family_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.family <- apply(as.matrix(beta.div.family), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.family <- uniqueness.family %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+#taxa diversity for order
+order_tse <- altExp(metaphlan_tse,"Order")
+beta.div.order <- rbiom::beta.div(assay(order_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.order <- apply(as.matrix(beta.div.order), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.order <- uniqueness.order %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+#taxa diversity for class
+class_tse <- altExp(metaphlan_tse,"Class")
+beta.div.class <- rbiom::beta.div(assay(class_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.class <- apply(as.matrix(beta.div.class), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.class <- uniqueness.class %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+#taxa diversity for phylum
+phylum_tse <- altExp(metaphlan_tse,"Phylum")
+beta.div.phylum <- rbiom::beta.div(assay(phylum_tse, "counts"), method="bray-curtis", weighted=TRUE)
+uniqueness.phylum <- apply(as.matrix(beta.div.phylum), 1, FUN = function(x) {min(x[x > 0])})
+
+#join with metadata
+b.phylum <- uniqueness.phylum %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename("uniqueness"=value) %>%
+  dplyr::inner_join(sample.meta, by = "sample.ID")
+
+```
+
+## Save bray-curtis distances
+
+```{r}
+#save pair-wise distances information to excel file
+BC_list <- list(
+  BC.phylum = as_tibble(as.matrix(beta.div.phylum), rownames="sample.ID"),
+  BC.class = as_tibble(as.matrix(beta.div.class), rownames="sample.ID"),
+  BC.order = as_tibble(as.matrix(beta.div.order), rownames="sample.ID"),
+  BC.family = as_tibble(as.matrix(beta.div.family), rownames="sample.ID"),
+  BC.genus = as_tibble(as.matrix(beta.div.genus), rownames="sample.ID"),
+  BC.species = as_tibble(as.matrix(beta.div.species), rownames="sample.ID")
+  )
+
+write_xlsx(BC_list, paste0(outpath,"BC_metaphlan_chinese.xlsx"))
+```
+
+
+# Uniqueness
+
+
+```{r, fig.dim = c(20,10)}
+p.s_age <- ggplot(b.species, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species") 
+    
+
+#For genus level
+p.g_age <- ggplot(b.genus, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) +
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus") 
+    
+
+#For family level
+p.f_age <- ggplot(b.family, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family") 
+    
+
+
+#For order level
+p.o_age <- ggplot(b.order, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order")
+
+
+#For class level
+p.c_age <- ggplot(b.class, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class")
+
+
+#For phylum level
+p.p_age <- ggplot(b.phylum, aes(x=c_age_years, y=uniqueness)) + 
+    geom_point(fill="blue") + 
+    ylim(0,1) + 
+    theme_bw(base_size = 20) +
+    theme(axis.title.y=element_blank(), axis.title.x=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum")
+
+
+#Plot together in one panel
+ggpubr::ggarrange(p.p_age, p.c_age, p.o_age, p.f_age, p.g_age, p.s_age, 
+          ncol = 6, nrow = 1)
+
+```
+
+
+# PCOA of beta diversity distances across taxonomic levels
+
+```{r}
+#species
+pcoa.species <- ape::pcoa(beta.div.species)
+pcoa.species_variance_explained <- round(pcoa.species$values$Eigenvalues/sum(pcoa.species$values$Eigenvalues) * 100, 2)
+pcoa.species.join <- pcoa.species$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID")) 
+
+#genus
+pcoa.genus <- ape::pcoa(beta.div.genus)
+pcoa.genus_variance_explained <- round(pcoa.genus$values$Eigenvalues/sum(pcoa.genus$values$Eigenvalues) * 100, 2)
+pcoa.genus.join <- pcoa.genus$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID"))
+
+#family
+pcoa.family <- ape::pcoa(beta.div.family)
+pcoa.family_variance_explained <- round(pcoa.family$values$Eigenvalues/sum(pcoa.family$values$Eigenvalues) * 100, 2)
+pcoa.family.join <- pcoa.family$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID"))
+
+#order
+pcoa.order <- ape::pcoa(beta.div.order)
+pcoa.order_variance_explained <- round(pcoa.order$values$Eigenvalues/sum(pcoa.order$values$Eigenvalues) * 100, 2)
+pcoa.order.join <- pcoa.order$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID"))
+
+#class
+pcoa.class <- ape::pcoa(beta.div.class)
+pcoa.class_variance_explained <- round(pcoa.class$values$Eigenvalues/sum(pcoa.class$values$Eigenvalues) * 100, 2)
+pcoa.class.join <- pcoa.class$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID"))
+
+#phylum
+pcoa.phylum <- ape::pcoa(beta.div.phylum)
+pcoa.phylum_variance_explained <- round(pcoa.phylum$values$Eigenvalues/sum(pcoa.phylum$values$Eigenvalues) * 100, 2)
+pcoa.phylum.join <- pcoa.phylum$vectors[, 1:4] %>% as_tibble(rownames="sample.ID") %>%
+  dplyr::rename(PCOA_1=Axis.1, PCOA_2=Axis.2, PCOA_3=Axis.3, PCOA_4=Axis.4) %>%
+  dplyr::inner_join(sample.meta, by=c("sample.ID"="sample.ID"))
+
+```
+
+
+## PCOA: PC1 and PC2
+
+```{r, fig.dim=c(20,15)}
+p.species <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3 ) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species") +
+  xlab(paste0("PCOA_1 (", pcoa.species_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.species_variance_explained[2], "%)"))
+    
+p.genus <- ggplot(pcoa.genus.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus") +
+  xlab(paste0("PCOA_1 (", pcoa.genus_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.genus_variance_explained[2], "%)"))
+
+p.family <- ggplot(pcoa.family.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Family") +
+  xlab(paste0("PCOA_1 (", pcoa.family_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.family_variance_explained[2], "%)"))
+
+p.order <- ggplot(pcoa.order.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order") +
+  xlab(paste0("PCOA_1 (", pcoa.order_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.order_variance_explained[2], "%)"))
+
+
+p.class <- ggplot(pcoa.class.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class") +
+  xlab(paste0("PCOA_1 (", pcoa.class_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.class_variance_explained[2], "%)"))
+
+
+p.phylum <- ggplot(pcoa.phylum.join, aes(PCOA_1, PCOA_2))+
+  geom_point(size=3) + 
+  theme_bw(base_size=20) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum") +
+  xlab(paste0("PCOA_1 (", pcoa.phylum_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.phylum_variance_explained[2], "%)"))
+
+
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.family, p.genus, p.species, ncol = 3, nrow = 2)
+```
+
+
+## Save pcoa analysis results for PC1 and PC2
+
+```{r}
+#save pcoa information to excel file and rds
+pcoa_list <- list(
+  pcoa.phylum = pcoa.phylum.join %>% dplyr::select(sample.ID, c_age_years,PCOA_1, PCOA_2) %>%
+  dplyr::mutate(age = case_when(c_age_years < 70 ~ "<70",
+                                c_age_years >=70 & c_age_years <= 79 ~ "70-79",
+                                c_age_years >=80 & c_age_years <= 99 ~ "80-99",
+                                c_age_years >= 100 ~ ">100")) %>%
+    dplyr::select(sample.ID, age, PCOA_1, PCOA_2),
+  pcoa.class = pcoa.class.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.order = pcoa.order.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.family = pcoa.family.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.genus = pcoa.genus.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2),
+  pcoa.species = pcoa.species.join %>% dplyr::select(sample.ID, PCOA_1, PCOA_2)
+)
+saveRDS(pcoa_list, paste0(outpath,"pcoa_metaphlan4_chinese.rds"))
+write_xlsx(pcoa_list, paste0(outpath,"pcoa_metaphlan4_chinese.xlsx"))
+```
+
+
+## PERMANOVA: Association with age
+
+```{r}
+samp.dat <- as.matrix(subset_chinese_biom@sam_data)
+#species level
+dist_matrix.species <- as.matrix(beta.div.species)
+samp.dat.species <- as.data.frame(samp.dat[rownames(dist_matrix.species),])
+
+pm.species<-adonis2(dist_matrix.species~as.integer(samp.dat.species$c_age_years), data=samp.dat.species, permutations=999, by="margin")
+pm.species
+
+pval.species <- pm.species$`Pr(>F)`[1]
+F.species <- pm.species$F[1] %>% signif(3)
+
+#genus level
+dist_matrix.genus <- as.matrix(beta.div.genus)
+samp.dat.genus <- as.data.frame(samp.dat[rownames(dist_matrix.genus),])
+
+pm.genus<-adonis2(dist_matrix.genus~as.integer(samp.dat.genus$c_age_years), data=samp.dat.genus, permutations=999, by="margin")
+pm.genus
+
+pval.genus <- pm.genus$`Pr(>F)`[1]
+F.genus <- pm.genus$F[1] %>% signif(3)
+
+
+#family level
+dist_matrix.family <- as.matrix(beta.div.family)
+samp.dat.family <- as.data.frame(samp.dat[rownames(dist_matrix.family),])
+
+pm.family<-adonis2(dist_matrix.family~as.integer(samp.dat.family$c_age_years), data=samp.dat.family, permutations=999, by="margin")
+pm.family
+
+pval.family <- pm.family$`Pr(>F)`[1]
+F.family <- pm.family$F[1] %>% signif(3)
+
+#order level
+dist_matrix.order <- as.matrix(beta.div.order)
+samp.dat.order <- as.data.frame(samp.dat[rownames(dist_matrix.order),])
+
+pm.order<-adonis2(dist_matrix.order~as.integer(samp.dat.order$c_age_years), data=samp.dat.order, permutations=999, by="margin")
+pm.order
+
+pval.order <- pm.order$`Pr(>F)`[1]
+F.order <- pm.order$F[1] %>% signif(3)
+
+#class level
+dist_matrix.class <- as.matrix(beta.div.class)
+samp.dat.class <- as.data.frame(samp.dat[rownames(dist_matrix.class),])
+
+pm.class<-adonis2(dist_matrix.class~as.integer(samp.dat.class$c_age_years), data=samp.dat.class, permutations=999, by="margin")
+pm.class
+
+pval.class <- pm.class$`Pr(>F)`[1]
+F.class <- pm.class$F[1] %>% signif(3)
+
+
+#phylum level
+dist_matrix.phylum <- as.matrix(beta.div.phylum)
+samp.dat.phylum <- as.data.frame(samp.dat[rownames(dist_matrix.phylum),])
+
+pm.phylum<-adonis2(dist_matrix.phylum~as.integer(samp.dat.phylum$c_age_years), data=samp.dat.phylum, permutations=999, by="margin")
+pm.phylum
+
+pval.phylum <- pm.phylum$`Pr(>F)`[1]
+F.phylum <- pm.phylum$F[1] %>% signif(3)
+
+```
+
+
+## PCOA colored by age (continuous)
+
+```{r, fig.dim=c(30,20)}
+p.plot <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=60) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1.8, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) 
+
+p.legend <- p.plot %>% get_legend() %>% as_ggplot
+
+p.species <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Species" , 
+         subtitle=paste(paste0("F=",F.species,","),paste0("p=",pval.species))) +
+  scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.species_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.species_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.6,0.5)
+    
+p.genus <- ggplot(pcoa.genus.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Genus",
+         subtitle=paste(paste0("F=",F.genus,","),paste0("p=",pval.genus))) +
+  scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.genus_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.genus_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.6,0.6)
+
+p.family <- ggplot(pcoa.family.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Family",
+         subtitle=paste(paste0("F=",F.family,","),paste0("p=",pval.family))) +
+  scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.family_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.family_variance_explained[2], "%)")) +
+  ylim(-0.6,0.8) +
+  xlim(-0.6,0.6)
+
+p.order <- ggplot(pcoa.order.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Order",
+         subtitle=paste(paste0("F=",F.order,","),paste0("p=",pval.order))) +
+  scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.order_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.order_variance_explained[2], "%)")) +
+ ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.class <- ggplot(pcoa.class.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Class", 
+         subtitle=paste(paste0("F=",F.class,","),paste0("p=",pval.class))) +
+  scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.class_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.class_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.phylum <- ggplot(pcoa.phylum.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=6) + 
+  theme_bw(base_size=50) +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    labs(title="Phylum",
+         subtitle=paste(paste0("F=",F.phylum,","),paste0("p=",pval.phylum))) +
+ scale_color_continuous(type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.phylum_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.phylum_variance_explained[2], "%)")) +
+  ylim(-0.8,0.6) +
+  xlim(-0.5,0.8)
+
+#Plot together in one panel
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+
+
+#create directory for figures
+dir.create(paste0(outpath, "Figures/metaphlan/"))
+
+#save figures
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_alllevels.png"), units="in", width=50, height=20, res=300)
+ggpubr::ggarrange(p.phylum, p.class, p.order, p.legend, p.family, p.genus, p.species, ncol = 4, nrow = 2)
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_main.png"), units="in", width=40, height=12, res=300)
+ggpubr::ggarrange(p.phylum, p.genus, p.species, p.legend, ncol = 4, nrow = 1)
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_supp.png"), units="in", width=40, height=12, res=300)
+ggpubr::ggarrange(p.class, p.order, p.family, p.legend, ncol = 4, nrow = 1)
+dev.off()
+```
+
+```{r, fig.dim=c(30,20)}
+#save each figure separately
+p.species <- ggplot(pcoa.species.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Species" , subtitle=paste0("p=",pval.species)) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.species_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.species_variance_explained[2], "%)")) +
+   ylim(-0.6,0.6) +
+  xlim(-0.6,0.5)
+    
+p.genus <- ggplot(pcoa.genus.join, aes(PCOA_1, PCOA_2, color=age_group))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Genus", subtitle=paste0("p=",pval.genus)) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.genus_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.genus_variance_explained[2], "%)")) +
+  ylim(-0.6,0.6) +
+  xlim(-0.6,0.6)
+
+p.family <- ggplot(pcoa.family.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Family", subtitle=paste0("p=",pval.family)) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.family_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.family_variance_explained[2], "%)")) +
+  ylim(-0.6,0.8) +
+  xlim(-0.6,0.6)
+
+p.order <- ggplot(pcoa.order.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Order", subtitle=paste0("p=",pval.order)) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.order_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.order_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.class <- ggplot(pcoa.class.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Class", subtitle=paste0("p=",pval.class)) +
+  scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.class_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.class_variance_explained[2], "%)")) +
+  ylim(-0.8,1) +
+  xlim(-0.7,0.8)
+
+p.phylum <- ggplot(pcoa.phylum.join, aes(PCOA_1, PCOA_2))+
+  geom_point(aes(colour=c_age_years), size=3) + 
+  theme_bw(base_size=35) +
+    theme(plot.title = element_text(hjust = 0.5), 
+          legend.key.height= unit(1, 'cm'),
+        legend.key.width= unit(1, 'cm')) +
+    labs(title="Phylum", subtitle=paste0("p=",pval.phylum)) +
+ scale_color_continuous(name = "age", type="viridis", limits=c(50,110)) +
+  xlab(paste0("PCOA_1 (", pcoa.phylum_variance_explained[1], "%)")) +
+  ylab(paste0("PCOA_2 (", pcoa.phylum_variance_explained[2], "%)")) +
+  ylim(-0.8,0.5) +
+  xlim(-0.5,0.8)
+
+
+
+#save each plot
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_phylum.png"), units="in", width=12, height=10, res=300)
+p.phylum
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_class.png"), units="in", width=12, height=10, res=300)
+p.class
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_order.png"), units="in", width=12, height=10, res=300)
+p.order
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_family.png"), units="in", width=12, height=10, res=300)
+p.family
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_genus.png"), units="in", width=12, height=10, res=300)
+p.genus
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/pcoa_metaphlan_chinese_species.png"), units="in", width=12, height=10, res=300)
+p.species
+dev.off()
+```
