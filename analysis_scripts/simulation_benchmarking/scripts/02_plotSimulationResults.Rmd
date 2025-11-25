@@ -1,0 +1,484 @@
+---
+title: "Simulation results (Two Studies)"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Requirements
+
+## Load project packages and directories
+
+```{r, message=FALSE}
+## Load packages and directories
+require(cowplot)
+require(pROC)
+require(ggh4x)
+require(dplyr)
+```
+
+## Directories
+
+```{r}
+baseDir <- ".."
+rDir <- file.path(baseDir, "R")
+resDir <- file.path(baseDir, "results")
+compDir <- file.path(resDir, "compiled")
+```
+
+## Set files to read and write
+
+```{r}
+# Files to read in
+  
+## Simulation results
+simCompFile <- file.path(compDir, "compiled_performance.rds")
+```
+
+## Read in saved objects
+
+```{r}
+simResAggAllSel <- readRDS(simCompFile)
+```
+
+# Format method names for plotting
+
+```{r}
+
+methNames <- c("amp" = "AdjMaxP",
+               "pb" = "Province-Borecki",
+               "naive" = "Naive")
+
+studNames <- c("2" = "Two")
+
+```
+
+# Create grid based on number of studies and tests
+
+```{r}
+nstGrid <- simResAggAllSel %>%
+  dplyr::select(nStudies, nTest) %>%
+  unique %>%
+  arrange(nStudies, nTest) %>%
+  as.data.frame()
+```
+
+
+## Plot NULL models
+
+### Specificity
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=FALSE, results='asis'}
+nullModPlotList <- mapply(function(ns, nt) {
+  
+  simResAggAllSelNull <- simResAggAllSel %>%
+    filter(both == "0" &
+             p_type == "nominal" &
+             nStudies == ns &
+             nTest == nt)
+  simResAggAllSelNull$meth <- factor(simResAggAllSelNull$meth, levels=c("amp", "pb", "naive"))
+  
+  p <- ggplot(simResAggAllSelNull, aes(x = corPfac, y = spec, color = meth, fill = meth)) +
+  geom_boxplot() +
+  facet_nested(~signalCons + signalUnCons) +
+  theme_bw() +
+  scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+  scale_x_discrete("Background Correlation") +
+  guides(fill = guide_legend(title.position = "left"),
+         color = guide_legend(title.position = "left")) +
+  theme(axis.text.y = element_text(size = 15),
+        axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+        axis.title = element_text(size = 17),
+        plot.title = element_text(size = 20, face = "bold"),
+        plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+        plot.subtitle = element_text(size = 19),
+        # NEW legend syntax
+        legend.position = "top",
+        #legend.position.inside = c(1, 1.46),
+        legend.justification = "right",
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 17),
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(size = 20)) +
+  coord_cartesian(ylim = c(0.7, 1), expand = 0) +
+  scale_y_continuous("Specificity") +
+  ggtitle("Specificity (Nominal P-value < 0.05)", paste0(studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+  
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+for(i in seq_along(nullModPlotList)) {
+  print(nullModPlotList[[i]])
+}
+```
+
+
+
+## Plot models
+
+### Nominal P-value
+
+#### AUC
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+aucModPlotList <- mapply(function(ns, nt) {
+  
+  simResAggAllSelC2nom <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "nominal" &
+             nStudies == ns &
+             nTest == nt)
+  simResAggAllSelC2nom$meth <- factor(simResAggAllSelC2nom$meth, levels=c("amp", "pb", "naive"))
+
+  p <- ggplot(simResAggAllSelC2nom, aes(x = corPfac, y = auc, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+      theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 20),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    scale_y_continuous("Area Under the Curve") +
+    coord_cartesian(ylim = c(0, 1), expand = FALSE) +
+    ggtitle("Area Under the Curve", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+
+for(i in seq(nrow(nstGrid))) {
+  print(aucModPlotList[[i]])
+}
+```
+
+#### Sensitivity | Specificity = 0.95
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+
+sensSpec95ModPlotList <- mapply(function(ns, nt) {
+  
+  simResAggAllSelC2nom <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "nominal" &
+             nStudies == ns &
+             nTest == nt)
+  
+  simResAggAllSelC2nom$meth <- factor(simResAggAllSelC2nom$meth, levels=c("amp", "pb", "naive"))
+
+  p <- ggplot(simResAggAllSelC2nom, aes(x = corPfac, y = sensAlt, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+    theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 18),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    scale_y_continuous("Sensitivity (Specificity = 0.95)") +
+    coord_cartesian(ylim = c(0, 1), expand = FALSE) +
+    ggtitle("Sensitivity (Specificity = 0.95)", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+
+for(i in seq(nrow(nstGrid))) {
+  print(sensSpec95ModPlotList[[i]])
+}
+```
+
+#### P-value | Specificity = 0.95
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+pvalSpec95ModPlotList <- mapply(function(ns, nt) {
+  
+  simResAggAllSelC2nom <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "nominal" &
+             nStudies == ns &
+             nTest == nt)
+  
+  simResAggAllSelC2nom$meth <- factor(simResAggAllSelC2nom$meth, levels=c("amp", "pb", "naive"))
+
+  p <- ggplot(simResAggAllSelC2nom, aes(x = corPfac, y = pAlt, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+    theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 18),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    scale_y_log10("P-value (Specificity = 0.95)", breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.05, 0.1), labels = c("1E-5", "1E-4", "1E-3", "0.01", "0.05", "0.1")) +
+    coord_cartesian(ylim = c(0.00001, 0.1)) + 
+    ggtitle("P-value  (Specificity = 0.95)", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+for(i in seq(nrow(nstGrid))) {
+  print(pvalSpec95ModPlotList[[i]])
+}
+
+```
+
+### 20% Conserved Features FDR
+
+#### Sensitivity
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+
+SensModPlotList <- mapply(function(ns, nt) {
+
+  simResAggAllSelC2fdr <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "fdr" &
+             nStudies == ns &
+             nTest == nt)
+  
+  simResAggAllSelC2fdr$meth <- factor(simResAggAllSelC2fdr$meth, levels=c("amp", "pb", "naive"))
+  
+  p <- ggplot(simResAggAllSelC2fdr, aes(x = corPfac, y = sens, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+    theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 18),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    coord_cartesian(ylim = c(0, 0.85), expand = 0) +
+    scale_y_continuous("Sensitivity") +
+    ggtitle("Sensitivity (FDR < 0.05)", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+
+for(i in seq(nrow(nstGrid))) {
+  print(SensModPlotList[[i]])
+}
+
+```
+
+#### Specificity
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+
+SpecModPlotList <- mapply(function(ns, nt) {
+
+  simResAggAllSelC2fdr <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "fdr" &
+             nStudies == ns &
+             nTest == nt)
+  
+  simResAggAllSelC2fdr$meth <- factor(simResAggAllSelC2fdr$meth, levels=c("amp", "pb", "naive"))
+  
+  p <- ggplot(simResAggAllSelC2fdr, aes(x = corPfac, y = spec, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+    theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 18),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    coord_cartesian(ylim = c(0.8, 1), expand = 0) +
+    scale_y_continuous("Specificity") +
+    ggtitle("Specificity (FDR < 0.05)", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+for(i in seq(nrow(nstGrid))) {
+  print(SpecModPlotList[[i]])
+}
+
+```
+
+#### Precision
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+PrecModPlotList <- mapply(function(ns, nt) {
+
+  simResAggAllSelC2fdr <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "fdr" &
+             nStudies == ns &
+             nTest == nt)
+
+  simResAggAllSelC2fdr$meth <- factor(simResAggAllSelC2fdr$meth, levels=c("amp", "pb", "naive"))
+
+  p <- ggplot(simResAggAllSelC2fdr, aes(x = corPfac, y = prec, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+    theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 18),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    coord_cartesian(ylim = c(0, 1), expand = 0) +
+    scale_y_continuous("Precision") +
+    ggtitle("Precision (FDR < 0.05)", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+for(i in seq(nrow(nstGrid))) {
+  print(PrecModPlotList[[i]])
+}
+```
+
+#### AUC
+
+```{r, fig.align='center', fig.width = 20, fig.height = 10, echo=TRUE}
+aucModPlotList <- mapply(function(ns, nt) {
+  
+  simResAggAllSelC2nom <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "fdr" &
+             nStudies == ns &
+             nTest == nt)
+  simResAggAllSelC2nom$meth <- factor(simResAggAllSelC2nom$meth, levels=c("amp", "pb", "naive"))
+
+  p <- ggplot(simResAggAllSelC2nom, aes(x = corPfac, y = auc, color = meth, fill = meth)) +
+    geom_boxplot() +
+    facet_nested(~signalCons + signalUnCons) +
+    theme_bw() +
+    scale_color_manual(name = "Method:", values = c(amp = "black", pb = "grey40", naive = "slategray4"), labels = methNames) +
+  scale_fill_manual(name = "Method:", values = c(amp = "grey60", pb = "grey80", naive = "slategray3"), labels = methNames) +
+    scale_x_discrete("Background Correlation") +
+    guides(fill = guide_legend(title.position = "left"),
+           color = guide_legend(title.position = "left")) +
+      theme(axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+          axis.title = element_text(size = 17),
+          plot.title = element_text(size = 20, face = "bold"),
+          plot.margin = unit(c(0, 0, 0, 0.08), "null"),
+          plot.subtitle = element_text(size = 20),
+          # NEW legend syntax
+          legend.position = "top",
+          #legend.position.inside = c(1, 1.46),
+          legend.justification = "right",
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 17),
+          strip.background = element_rect(fill = "white"),
+          strip.text = element_text(size = 20)) +
+    scale_y_continuous("Area Under the Curve") +
+    coord_cartesian(ylim = c(0.45, 1), expand = FALSE) +
+    ggtitle("Area Under the Curve", paste0("20% Conserved Features, ", studNames[ns], " Studies, ", nt, " Features"))
+  
+  return(p)
+}, nstGrid$nStudies, nstGrid$nTest, SIMPLIFY = FALSE)
+
+
+for(i in seq(nrow(nstGrid))) {
+  print(aucModPlotList[[i]])
+}
+```
+
+```{r, eval=F, echo=FALSE}
+simResAggAllSelC2fdr <- simResAggAllSel %>%
+    filter(both == "2" &
+             p_type == "fdr" &
+             nStudies == 2 &
+             nTest == 400)
+
+amp_measures <- simResAggAllSelC2fdr %>% dplyr::filter(bothProp==0.2 & both==2 & altProp==0.2 & alt==4 & meth=="amp")
+amp_measures %>% group_by(corPfac) %>% summarize(mean_est=round(mean(auc),2))
+```
+

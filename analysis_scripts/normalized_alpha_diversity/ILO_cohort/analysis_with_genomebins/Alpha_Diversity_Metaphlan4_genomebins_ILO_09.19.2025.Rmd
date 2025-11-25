@@ -1,0 +1,631 @@
+---
+title: "Alpha diversity analysis with metaphlan4 data with genome bins from ILO cohort"
+author: "Ye Chen, Tanya Karagiannis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    theme: united
+    toc: yes
+    toc_collapse: no
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ape)
+library(DESeq2)
+library(stringr)
+library(reshape2)
+library(graphics)
+
+library(codebook)
+library(future)
+#library(vtable)
+library(useful)
+
+library(vegan)
+library(data.table)
+
+# Data Cleaning
+library(janitor)
+
+# EDA
+library(skimr)
+library(DataExplorer)
+
+# ggplot2 Helpers
+library(ggplot2)
+library(ggsignif)
+library(scales)
+library(phyloseq)
+library(tidyverse)
+library(tidymodels)
+#heatmap
+library(pheatmap)
+
+#specify file path
+flpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/processed_data/data_library/manuscript_review_data_09.17.2025/"
+qcpath <- "/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_comined_cohort/processed_data/qc_analysis/"
+outpath <- "/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/ILO_genomebins/output/"
+meta.dir <-"/restricted/projectnb/uh2-sebas/data/metagenomics/ILO_combined_cohort/decoder/archived/"
+
+otufl <- "metaphlan4_genomebins_renorm_ILO_phyloseq.09.17.2025.rds"
+phenofl <- "2024-11-18.cleaned.metag.list.csv"
+
+```
+
+This script is for diversity analysis using data after QC.
+
+```{r user-defined functions}
+## outlier function
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+
+# calculate relative abundance/normalized abundance
+get_relabund <- function(indat, varname){
+  relabund <- as.tibble(indat) %>%
+    janitor::adorn_percentages("col") %>%
+    column_to_rownames(var = varname) 
+}
+# 
+source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/function/CTDS_function.R")
+
+#function to aggregate otu abundances, calculate proportions and calculated CTDS based on taxonomic hierarchy
+otu_ctds <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+  #load ctds function
+  source("/restricted/projectnb/uh2-sebas/analysis/metagenomics/parallel_systems_comparison/03_alpha_diversity_analysis/function/CTDS_function.R")
+  
+  #prepare taxonomic and otu data to run diversity analysis
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no species label
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") 
+ # message(paste("taxa table rows:",nrow(biom_taxdata)))
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  
+  #save sample names
+  biom_samplenames <- colnames(otudata)
+  #message(paste("taxa table rows:",nrow(biom_otudata)))
+
+  
+  #taxa dictionary: taxonomy table with taxa ID and taxa names
+  taxa_dict <- biom_taxdata %>% 
+    dplyr::select(tax.ID, {{rank}}) %>%
+    unite("tax.name", {{rank}}, remove = FALSE)
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  #create new variable taxanames to create unique
+  biom_join <- dplyr::inner_join(taxa_dict, biom_otudata, by = "tax.ID")
+  #message(paste("joined table rows:", nrow(biom_join))) 
+
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  # biom_prop <- biom_join %>% 
+  #   group_by(tax.name) %>% #use rank groupings
+  #   summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+  #   select(c(tax.name, contains(".aggregrated.report"))) %>% #select rank and sample OTU abundances
+  #   dplyr::rename(tax.ID = tax.name) %>%
+  #   tibble::column_to_rownames(var = "tax.ID") %>% #make tax.ID variable to rownames
+  #   t()
+  
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>% #use rank groupings
+    summarise_if(is.numeric, sum) %>% #aggregate OTU abundances for each taxa in the rank
+    dplyr::select(tax.name, biom_samplenames) %>% #select rank and sample OTU abundances
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    #janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  
+
+  #ctds function
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+  
+
+}
+
+
+prop_mat <- function(taxadata = biom_ilo_kraken.taxa, 
+                     otudata=biom_ilo_kraken.otu, rank=rank, 
+                     sample.meta=sample.meta){
+
+  #convert taxonomic table to a tibble with rownames as a column called tax.ID
+  #filter taxonomic table to remove taxa with no taxa classification in any level
+  biom_taxdata <- as_tibble(taxadata, rownames = "tax.ID") %>% 
+    unite("tax.name", kingdom:{{rank}}, remove = FALSE)
+
+  #row number for taxa data after removing incomplete classification
+  message(paste("taxa table rows:",nrow(biom_taxdata)))
+
+  #convert otu table to a tibble with rownames as a column called tax.ID
+  biom_otudata <- as_tibble(otudata, rownames = "tax.ID")
+  #row number for otu data before removing incomplete classification
+  message(paste("otu table rows:",nrow(biom_otudata)))
+
+  #use an inner_join function from dplyr to join data from both table based on common tax ID
+  biom_join <- inner_join(biom_taxdata, biom_otudata, by = "tax.ID")
+  #row number for joined data
+  message(paste("joined table rows:", nrow(biom_join))) #row number 11039 for the common taxa
+  
+  biom_taxid <- biom_join %>% select(c(tax.ID, tax.name))
+  
+
+  #remove rankings and transpose data for samples in rows and taxa IDs in columns
+  #make sure the samples are set as rownames
+  biom_prop <- biom_join %>% 
+    group_by(tax.name) %>%
+    summarise_if(is.numeric, sum) %>% 
+    select(c(tax.name, contains(".aggregrated.report"))) %>%
+    column_to_rownames(var = "tax.name") %>% #make tax.name variable to rownames
+    t() %>% #transpose data to have taxa in columns and samples as rows
+    as_tibble(rownames = "sample.ID") %>% #make transposed data into a tibble with rownames as sample.ID variable
+    janitor::adorn_percentages() %>% #use janitor package to get row proportions for each sample
+    column_to_rownames(var = "sample.ID") #add sample IDs back to rownames
+  dim(biom_prop)
+  useful::corner(biom_prop) #use this to visualize a corner of the data
+
+  #rerun abundance table
+  biom.res <- CTDS.score(biom_prop, metadata = sample.meta)
+  return(biom.res)
+
+}
+```
+
+# Read in phenotypic data
+
+```{r, message=F}
+pheno.data <- read_csv(paste0(meta.dir,phenofl) ) %>%
+  dplyr::mutate(Sample=stool_kit)
+
+pheno.data$stool_kit <- as.character(pheno.data$stool_kit)
+pheno.data$Sample <- as.character(pheno.data$Sample)
+
+SAMPLE_phy <- sample_data(pheno.data %>% column_to_rownames(var="Sample"))
+```
+
+# phyloseq object
+```{r read in data}
+#load phyloseq obj
+filtered_ilo_biom <- readRDS(paste0(flpath, otufl))
+
+#add phenotypic data to phyloseq object
+filtered_ilo_biom@sam_data <- SAMPLE_phy
+
+#keep samples with age group label
+subset_ilo_biom <- subset_samples(filtered_ilo_biom, !is.na(Age_at_FecalSample))
+
+OTU_filtered <- subset_ilo_biom@otu_table@.Data
+TAX_filtered <- subset_ilo_biom@tax_table@.Data
+
+sample.meta <- sample_data(subset_ilo_biom) %>% 
+  as_tibble(rownames="sample.ID")
+
+#save sample data for permanova
+samp.dat <- as.matrix(subset_ilo_biom@sam_data)
+```
+
+
+
+
+# Alpha diversity analysis using Adjusted Entropy 
+
+## Calculate alpha diversity using otu_ctds function
+
+```{r, warning=FALSE}
+#taxa diversity for species
+ctds.species <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum","Class","Order","Family","Genus","Species"), sample.meta = sample.meta)
+ctds.species$library_prep <- as.factor(ctds.species$library_prep)
+
+#taxa diversity for genus
+ctds.genus <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum","Class","Order","Family","Genus"), sample.meta = sample.meta)
+ctds.genus$library_prep <- as.factor(ctds.genus$library_prep)
+
+#taxa diversity for family
+ctds.family <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum","Class","Order","Family"), sample.meta = sample.meta)
+ctds.family$library_prep <- as.factor(ctds.family$library_prep)
+
+#taxa diversity for order
+ctds.order <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum","Class","Order"), sample.meta = sample.meta)
+ctds.order$library_prep <- as.factor(ctds.order$library_prep)
+
+#taxa diversity for class
+ctds.class <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum","Class"), sample.meta = sample.meta)
+ctds.class$library_prep <- as.factor(ctds.class$library_prep)
+
+#taxa diversity for phylum
+ctds.phylum <- otu_ctds(taxadata = TAX_filtered, otudata = OTU_filtered, rank = c("Kingdom","Phylum"), sample.meta = sample.meta)
+ctds.phylum$library_prep <- as.factor(ctds.phylum$library_prep)
+
+#extract scores and save as csv file
+ctds.phylum.score <- ctds.phylum %>% dplyr::select(sample.ID, Age_at_FecalSample, statistic) %>% dplyr::rename(phylum_statistic=statistic) %>%
+  dplyr::mutate(age = case_when(Age_at_FecalSample < 70 ~ "<70",
+                                Age_at_FecalSample >=70 & Age_at_FecalSample <= 79 ~ "70-79",
+                                Age_at_FecalSample >=80 & Age_at_FecalSample <= 99 ~ "80-99",
+                                Age_at_FecalSample >= 100 ~ ">100")) %>%
+  dplyr::select(sample.ID, age, phylum_statistic)
+ctds.class.score <- ctds.class %>% dplyr::select(statistic) %>% dplyr::rename(class_statistic=statistic)
+ctds.order.score <- ctds.order %>% dplyr::select(statistic) %>% dplyr::rename(order_statistic=statistic)
+ctds.family.score <- ctds.family %>% dplyr::select(statistic) %>% dplyr::rename(family_statistic=statistic)
+ctds.genus.score <- ctds.genus %>% dplyr::select(statistic) %>% dplyr::rename(genus_statistic=statistic)
+ctds.species.score <- ctds.species %>% dplyr::select(statistic) %>% dplyr::rename(species_statistic=statistic)
+
+ctds.list <- dplyr::bind_cols(ctds.phylum.score, ctds.class.score, ctds.order.score, ctds.family.score, ctds.genus.score, ctds.species.score)
+                  
+write_csv(ctds.list, file=paste0(outpath,"entropy.metaphlan4.genomebins.ilo.csv"))
+```
+
+
+## Age association
+
+```{r}
+#species level
+lm.species <- lm(statistic ~ Age_at_FecalSample, data=ctds.species)
+pval.species <- broom::tidy(lm.species) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.species <- broom::tidy(lm.species) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+
+summary(lm.species)
+
+#genus level
+lm.genus <- lm(statistic ~ Age_at_FecalSample, data=ctds.genus)
+pval.genus <- broom::tidy(lm.genus) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.genus <- broom::tidy(lm.genus) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+
+summary(lm.genus)
+
+#family level
+lm.family <- lm(statistic ~ Age_at_FecalSample, data=ctds.family)
+pval.family <- broom::tidy(lm.family) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.family <- broom::tidy(lm.family) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+
+summary(lm.family)
+
+#order level
+lm.order <- lm(statistic ~ Age_at_FecalSample, data=ctds.order)
+pval.order <- broom::tidy(lm.order) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.order <- broom::tidy(lm.order) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+
+summary(lm.order)
+
+#class level
+lm.class <- lm(statistic ~ Age_at_FecalSample, data=ctds.class)
+pval.class <- broom::tidy(lm.class) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.class <- broom::tidy(lm.class) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+summary(lm.class)
+
+#phylum level
+lm.phylum <- lm(statistic ~ Age_at_FecalSample, data=ctds.phylum)
+pval.phylum <- broom::tidy(lm.phylum) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(p.value) %>% signif(3)
+est.phylum <- broom::tidy(lm.phylum) %>% dplyr::filter(term=="Age_at_FecalSample") %>% pull(estimate) %>% signif(3)
+
+summary(lm.phylum)
+```
+
+## Visualize changes in adjusted entropy with age
+
+```{r, fig.dim = c(50,10)}
+#For species level
+p.s_age <- ggplot(ctds.species, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species", subtitle=paste(
+      paste0("b=",est.species), 
+      paste0("p=",pval.species)
+      )) +
+  xlab("age")
+    
+
+#For genus level
+p.g_age <- ggplot(ctds.genus, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+    ylim(-1,0) +
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus", subtitle=paste(
+      paste0("b=",est.genus), 
+      paste0("p=",pval.genus)
+      )) +
+  xlab("age")
+    
+
+#For family level
+p.f_age <- ggplot(ctds.family, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family", subtitle=paste(
+      paste0("b=",est.family), 
+      paste0("p=",pval.family)
+      )) +
+  xlab("age")
+    
+
+
+#For order level
+p.o_age <- ggplot(ctds.order, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() +
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order", subtitle=paste(
+      paste0("b=",est.order), 
+      paste0("p=",pval.order)
+      )) +
+  xlab("age")
+
+
+#For class level
+p.c_age <- ggplot(ctds.class, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class", subtitle=paste(
+      paste0("b=",est.class), 
+      paste0("p=",pval.class)
+      )) +
+  xlab("age")
+
+
+#For phylum level
+p.p_age <- ggplot(ctds.phylum, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() +
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum", subtitle=paste(
+      paste0("b=",est.phylum), 
+      paste0("p=",pval.phylum)
+      )) +
+  xlab("age")
+
+
+#create directory for figures
+dir.create(paste0(outpath, "Figures/metaphlan/"))
+
+#Plot together in one panel
+ggpubr::ggarrange(p.p_age, p.c_age, p.o_age, p.f_age, p.g_age, p.s_age, 
+          ncol = 6, nrow = 1)
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_alllevels.png"), units="in", width=30, height=20, res=300)
+ggpubr::ggarrange(p.p_age, p.c_age, p.o_age, p.f_age, p.g_age, p.s_age,
+          ncol = 3, nrow = 2)
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_main.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.p_age, p.g_age, p.s_age,
+           ncol = 3, nrow = 1)
+dev.off()
+
+#For family level
+p.f_age <- ggplot(ctds.family, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family", subtitle=paste(
+      paste0("b=",est.family), 
+      paste0("p=",pval.family)
+      )) +
+  xlab("age")
+    
+
+
+#For order level
+p.o_age <- ggplot(ctds.order, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() +
+  geom_smooth(method="lm") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.title.y=element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order", subtitle=paste(
+      paste0("b=",est.order), 
+      paste0("p=",pval.order)
+      )) +
+  xlab("age")
+
+
+#For class level
+p.c_age <- ggplot(ctds.class, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=40) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class", subtitle=paste(
+      paste0("b=",est.class), 
+      paste0("p=",pval.class)
+      )) +
+  xlab("age")
+
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_supp.png"), units="in", width=30, height=10, res=300)
+ggpubr::ggarrange(p.c_age, p.o_age, p.f_age,
+           ncol = 3, nrow = 1)
+dev.off()
+
+```
+
+## Save figures
+
+```{r}
+
+#Plot each taxonomic level separately
+p.s_age <- ggplot(ctds.species, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Species", subtitle=paste0("p=",pval.species)) 
+    
+
+#For genus level
+p.g_age <- ggplot(ctds.genus, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Genus", subtitle=paste0("p=",pval.genus)) 
+    
+
+#For family level
+p.f_age <- ggplot(ctds.family, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+  ggtitle("Family", subtitle=paste0("p=",pval.family)) 
+    
+
+
+#For order level
+p.o_age <- ggplot(ctds.order, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() +
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Order", subtitle=paste0("p=",pval.order))
+
+
+#For class level
+p.c_age <- ggplot(ctds.class, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() + 
+  geom_smooth(method="lm") +
+ ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Class", subtitle=paste0("p=",pval.class))
+
+
+#For phylum level
+p.p_age <- ggplot(ctds.phylum, aes(x=Age_at_FecalSample, y=statistic)) + 
+    geom_point() +
+  geom_smooth(method="lm") +
+  ylab("normalized alpha diversity") +
+  xlab("age") +
+    ylim(-1,0) + 
+  xlim(50,110) +
+    theme_bw(base_size=35) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none") +
+    ggtitle("Phylum", subtitle=paste0("p=",pval.phylum))
+
+
+
+#save each plot
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_phylum.png"), units="in", width=10, height=12, res=300)
+p.p_age
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_class.png"), units="in", width=10, height=12, res=300)
+p.c_age
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_order.png"), units="in", width=10, height=12, res=300)
+p.o_age
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_family.png"), units="in", width=10, height=12, res=300)
+p.f_age
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_genus.png"), units="in", width=10, height=12, res=300)
+p.g_age
+dev.off()
+
+png(paste0(outpath,"Figures/metaphlan/entropy_metaphlan_ilo_species.png"), units="in", width=10, height=12, res=300)
+p.s_age
+dev.off()
+
+```
+
+
